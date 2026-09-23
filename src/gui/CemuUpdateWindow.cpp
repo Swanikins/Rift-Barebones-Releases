@@ -1,5 +1,6 @@
 #include "gui/CemuUpdateWindow.h"
 
+#include "Common/RiftVersion.h"
 #include "Common/version.h"
 #include "util/helpers/helpers.h"
 #include "util/helpers/SystemException.h"
@@ -12,14 +13,16 @@
 #include <wx/msgdlg.h>
 #include <wx/stdpaths.h>
 
+#include <limits>
+#include <optional>
 #ifndef BOOST_OS_WINDOWS
 #include <unistd.h>
 #include <sys/stat.h>
 #endif
 
 #include <curl/curl.h>
+#include <rapidjson/document.h>
 #include <zip.h>
-#include <boost/tokenizer.hpp>
 
 
 wxDECLARE_EVENT(wxEVT_RESULT, wxCommandEvent);
@@ -29,7 +32,7 @@ wxDECLARE_EVENT(wxEVT_PROGRESS, wxCommandEvent);
 wxDEFINE_EVENT(wxEVT_PROGRESS, wxCommandEvent);
 
 CemuUpdateWindow::CemuUpdateWindow(wxWindow* parent)
-	: wxDialog(parent, wxID_ANY, _("Cemu update"), wxDefaultPosition, wxDefaultSize,
+	: wxDialog(parent, wxID_ANY, _("Rift update"), wxDefaultPosition, wxDefaultSize,
 		wxCAPTION | wxMINIMIZE_BOX | wxSYSTEM_MENU | wxTAB_TRAVERSAL | wxCLOSE_BOX)
 {
 	auto* sizer = new wxBoxSizer(wxVERTICAL);
@@ -40,7 +43,7 @@ CemuUpdateWindow::CemuUpdateWindow(wxWindow* parent)
 	auto* rows = new wxFlexGridSizer(0, 2, 0, 0);
 	rows->AddGrowableCol(1);
 
-	m_text = new wxStaticText(this, wxID_ANY, _("Checking for latest version..."));
+	m_text = new wxStaticText(this, wxID_ANY, _("Checking GitHub for the latest Rift iteration..."));
 	rows->Add(m_text, 0, wxALL | wxALIGN_CENTER_VERTICAL, 5);
 
 	{
@@ -57,7 +60,7 @@ CemuUpdateWindow::CemuUpdateWindow(wxWindow* parent)
 		rows->Add(right_side, 1, wxALIGN_RIGHT, 5);
 	}
 
-	m_changelog = new wxHyperlinkCtrl(this, wxID_ANY, _("Changelog"), wxEmptyString);
+	m_changelog = new wxHyperlinkCtrl(this, wxID_ANY, _("Release notes"), wxEmptyString);
 	rows->Add(m_changelog, 0, wxLEFT | wxBOTTOM | wxRIGHT | wxEXPAND, 5);
 
 	sizer->Add(rows, 0, wxALL | wxEXPAND, 5);
@@ -87,84 +90,177 @@ size_t CemuUpdateWindow::WriteStringCallback(char* ptr, size_t size, size_t nmem
 	return size * nmemb;
 };
 
-std::string _curlUrlEscape(CURL* curl, const std::string& input)
+namespace
 {
-	char* escapedStr = curl_easy_escape(curl, input.c_str(), input.size());
-	std::string r(escapedStr);
-	curl_free(escapedStr);
-	return r;
+	struct RiftIteration
+	{
+		uint32_t generation;
+		uint32_t revision;
+	};
+
+	constexpr std::optional<RiftIteration> ParseRiftIteration(std::string_view tag)
+	{
+		constexpr std::string_view prefix = "rift-iteration-";
+		if (!tag.starts_with(prefix))
+			return std::nullopt;
+		tag.remove_prefix(prefix.size());
+		if (tag.empty())
+			return std::nullopt;
+
+		RiftIteration iteration{};
+		uint32_t* value = &iteration.generation;
+		bool hasDigit = false;
+		bool hasRevision = false;
+		for (const char character : tag)
+		{
+			if (character == '.')
+			{
+				if (!hasDigit || hasRevision)
+					return std::nullopt;
+				hasRevision = true;
+				hasDigit = false;
+				value = &iteration.revision;
+				continue;
+			}
+			if (character < '0' || character > '9')
+				return std::nullopt;
+			const uint32_t digit = static_cast<uint32_t>(character - '0');
+			if (*value > (std::numeric_limits<uint32_t>::max() - digit) / 10)
+				return std::nullopt;
+			*value = (*value * 10) + digit;
+			hasDigit = true;
+		}
+		if (!hasDigit)
+			return std::nullopt;
+		return iteration;
+	}
+
+	constexpr bool IsNewerIteration(const RiftIteration& candidate, const RiftIteration& current)
+	{
+		return candidate.generation > current.generation ||
+			(candidate.generation == current.generation && candidate.revision > current.revision);
+	}
+
+	struct RiftRelease
+	{
+		RiftIteration iteration;
+		std::string tag;
+		std::string downloadUrl;
+		std::string releaseUrl;
+	};
+
+	std::optional<RiftRelease> ReadRelease(const rapidjson::Value& value, bool includePrereleases)
+	{
+		if (!value.IsObject() ||
+			(value.HasMember("draft") && value["draft"].IsBool() && value["draft"].GetBool()) ||
+			(!includePrereleases && value.HasMember("prerelease") && value["prerelease"].IsBool() && value["prerelease"].GetBool()) ||
+			!value.HasMember("tag_name") || !value["tag_name"].IsString() ||
+			!value.HasMember("html_url") || !value["html_url"].IsString() ||
+			!value.HasMember("assets") || !value["assets"].IsArray())
+		{
+			return std::nullopt;
+		}
+
+		const std::string tag = value["tag_name"].GetString();
+		const auto iteration = ParseRiftIteration(tag);
+		if (!iteration)
+			return std::nullopt;
+
+		for (const auto& asset : value["assets"].GetArray())
+		{
+			if (!asset.IsObject() || !asset.HasMember("name") || !asset["name"].IsString() ||
+				!asset.HasMember("browser_download_url") || !asset["browser_download_url"].IsString())
+			{
+				continue;
+			}
+
+			const std::string_view name = asset["name"].GetString();
+			if (!name.starts_with("Rift-Barebones-Iteration-") || !name.ends_with("-Windows-x64.zip"))
+				continue;
+
+			return RiftRelease{
+				*iteration,
+				tag,
+				asset["browser_download_url"].GetString(),
+				value["html_url"].GetString()
+			};
+		}
+
+		return std::nullopt;
+	}
+
+	static_assert(ParseRiftIteration("rift-iteration-006")->revision == 0);
+	static_assert(ParseRiftIteration("rift-iteration-006.12")->revision == 12);
+	static_assert(IsNewerIteration(*ParseRiftIteration("rift-iteration-007"), *ParseRiftIteration("rift-iteration-006.99")));
+	static_assert(!ParseRiftIteration("006.2"));
+	static_assert(ParseRiftIteration(RiftVersion::ReleaseTag).has_value());
 }
 
-std::string _curlUrlUnescape(CURL* curl, std::string_view input)
-{
-	int decodedLen = 0;
-	const char* decoded = curl_easy_unescape(curl, input.data(), input.size(), &decodedLen);
-	return std::string(decoded, decodedLen);
-}
-
-// returns true if update is available and sets output parameters
-bool CemuUpdateWindow::QueryUpdateInfo(std::string& downloadUrlOut, std::string& changelogUrlOut)
+bool CemuUpdateWindow::QueryUpdateInfo(std::string& downloadUrlOut, std::string& changelogUrlOut, std::string& latestTagOut)
 {
 	std::string buffer;
-	std::string urlStr("https://cemu.info/api2/version.php?v=");
+	constexpr std::string_view url = "https://api.github.com/repos/Swanikins/Rift-Barebones-Releases/releases?per_page=20";
 	auto* curl = curl_easy_init();
-	urlStr.append(_curlUrlEscape(curl, BUILD_VERSION_STRING));
-#if BOOST_OS_LINUX
-	urlStr.append("&platform=linux_appimage_x86");
-#elif BOOST_OS_WINDOWS
-	urlStr.append("&platform=windows");
-#elif BOOST_OS_MACOS
-	urlStr.append("&platform=macos_bundle_x86");
-#elif
-#error Name for current platform is missing
-#endif
-	const auto& config = GetConfig();
-	if(config.receive_untested_updates)
-		urlStr.append("&allowNewUpdates=1");
+	if (!curl)
+		return false;
 
-	curl_easy_setopt(curl, CURLOPT_URL, urlStr.c_str());
+	auto* headers = curl_slist_append(nullptr, "Accept: application/vnd.github+json");
+	headers = curl_slist_append(headers, "X-GitHub-Api-Version: 2022-11-28");
+	headers = curl_slist_append(headers, "Cache-Control: no-cache");
+	curl_easy_setopt(curl, CURLOPT_URL, url.data());
 	curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1);
 	curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buffer);
 	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteStringCallback);
-	curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
-	curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+	curl_easy_setopt(curl, CURLOPT_USERAGENT, RiftVersion::UserAgent);
+	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+	curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 8L);
+	curl_easy_setopt(curl, CURLOPT_TIMEOUT, 20L);
+	curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+	curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
 
 	bool result = false;
-	CURLcode cr = curl_easy_perform(curl);
+	const CURLcode cr = curl_easy_perform(curl);
 	if (cr == CURLE_OK)
 	{
 		long http_code = 0;
 		curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-		if (http_code != 0 && http_code != 200)
+		if (http_code == 200)
 		{
-			cemuLog_log(LogType::Force, "Update check failed (http code: {})", http_code);
-			cemu_assert_debug(false);
-			return false;
-		}
+			rapidjson::Document releases;
+			releases.Parse(buffer.data(), buffer.size());
+			const auto current = ParseRiftIteration(RiftVersion::ReleaseTag);
+			std::optional<RiftRelease> selected;
+			if (!releases.HasParseError() && releases.IsArray() && current)
+			{
+				for (const auto& value : releases.GetArray())
+				{
+					const auto release = ReadRelease(value, GetConfig().receive_untested_updates);
+					if (!release || !IsNewerIteration(release->iteration, *current))
+						continue;
+					if (!selected || IsNewerIteration(release->iteration, selected->iteration))
+						selected = release;
+				}
+			}
 
-		std::vector<std::string> tokens;
-		const boost::char_separator<char> sep{ "|" };
-		for (const auto& token : boost::tokenizer(buffer, sep))
-			tokens.emplace_back(token);
-
-		if (tokens.size() >= 3 && tokens[0] == "UPDATE")
-		{
-			// first token: "UPDATE"
-			// second token: Download URL
-			// third token: Changelog URL
-			// we allow more tokens in case we ever want to add extra information for future releases
-			downloadUrlOut = _curlUrlUnescape(curl, tokens[1]);
-			changelogUrlOut = _curlUrlUnescape(curl, tokens[2]);
-			if (!downloadUrlOut.empty() && !changelogUrlOut.empty())
+			if (selected)
+			{
+				downloadUrlOut = selected->downloadUrl;
+				changelogUrlOut = selected->releaseUrl;
+				latestTagOut = selected->tag;
 				result = true;
+			}
+		}
+		else
+		{
+			cemuLog_log(LogType::Force, "Rift update check failed with HTTP status {}", http_code);
 		}
 	}
 	else
 	{
-		cemuLog_log(LogType::Force, "Update check failed with CURL error {}", (int)cr);
-		cemu_assert_debug(false);
+		cemuLog_log(LogType::Force, "Rift update check failed with CURL error {}", static_cast<int>(cr));
 	}
 
+	curl_slist_free_all(headers);
 	curl_easy_cleanup(curl);
 	return result;
 }
@@ -176,8 +272,8 @@ std::future<bool> CemuUpdateWindow::IsUpdateAvailableAsync()
 
 bool CemuUpdateWindow::CheckVersion()
 {
-	std::string downloadUrl, changelogUrl;
-	return QueryUpdateInfo(downloadUrl, changelogUrl);
+	std::string downloadUrl, changelogUrl, latestTag;
+	return QueryUpdateInfo(downloadUrl, changelogUrl, latestTag);
 }
 
 
@@ -185,80 +281,53 @@ int CemuUpdateWindow::ProgressCallback(void* clientp, curl_off_t dltotal, curl_o
 	curl_off_t ulnow)
 {
 	auto* thisptr = (CemuUpdateWindow*)clientp;
+	if (dltotal > 0)
+		thisptr->m_gaugeMaxValue = static_cast<int>(std::min<curl_off_t>(dltotal, std::numeric_limits<int>::max()));
 	auto* event = new wxCommandEvent(wxEVT_PROGRESS);
-	event->SetInt((int)dlnow);
+	event->SetInt(static_cast<int>(std::min<curl_off_t>(dlnow, std::numeric_limits<int>::max())));
 	wxQueueEvent(thisptr, event);
-	return 0;
+	return thisptr->m_order == WorkerOrder::Exit ? 1 : 0;
 }
 
 bool CemuUpdateWindow::DownloadCemuZip(const std::string& url, const fs::path& filename)
 {
-	FileStream* fsUpdateFile = FileStream::createFile2(filename);
+	std::unique_ptr<FileStream> fsUpdateFile(FileStream::createFile2(filename));
 	if (!fsUpdateFile)
 		return false;
 
-	bool result = false;
 	auto* curl = curl_easy_init();
+	if (!curl)
+		return false;
+
+	auto writeData = +[](void* ptr, size_t size, size_t nmemb, void* context) -> size_t
+	{
+		auto* file = static_cast<FileStream*>(context);
+		const size_t writeSize = size * nmemb;
+		file->writeData(ptr, writeSize);
+		return writeSize;
+	};
+
 	curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-	curl_easy_setopt(curl, CURLOPT_NOBODY, 1);
-	curl_easy_setopt(curl, CURLOPT_USERAGENT, BUILD_VERSION_WITH_NAME_STRING);
-	curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+	curl_easy_setopt(curl, CURLOPT_USERAGENT, RiftVersion::UserAgent);
+	curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+	curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
 	curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1);
-	auto r = curl_easy_perform(curl);
-	if (r == CURLE_OK)
-	{
-		long http_code = 0;
-		curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-		if (http_code != 0 && http_code != 200)
-		{
-			cemuLog_log(LogType::Force, "Unable to download cemu update zip file from {} (http error: {})", url, http_code);
-			curl_easy_cleanup(curl);
-			return false;
-		}
+	curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
+	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeData);
+	curl_easy_setopt(curl, CURLOPT_WRITEDATA, fsUpdateFile.get());
+	curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0);
+	curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, ProgressCallback);
+	curl_easy_setopt(curl, CURLOPT_XFERINFODATA, this);
 
-		curl_off_t update_size;
-		if (curl_easy_getinfo(curl, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &update_size) == CURLE_OK)
-			m_gaugeMaxValue = (int)update_size;
-
-
-		auto _curlWriteData = +[](void* ptr, size_t size, size_t nmemb, void* ctx) -> size_t
-		{
-			FileStream* fs = (FileStream*)ctx;
-			const size_t writeSize = size * nmemb;
-			fs->writeData(ptr, writeSize);
-			return writeSize;
-		};
-
-		curl_easy_setopt(curl, CURLOPT_NOBODY, 0);
-		curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, _curlWriteData);
-		curl_easy_setopt(curl, CURLOPT_WRITEDATA, fsUpdateFile);
-		curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0);
-		curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, ProgressCallback);
-		curl_easy_setopt(curl, CURLOPT_XFERINFODATA, this);
-
-		auto curl_result = std::async(std::launch::async, [](CURL* curl, long* http_code)
-			{
-				const auto r = curl_easy_perform(curl);
-				curl_easy_cleanup(curl);
-				return r;
-			}, curl, &http_code);
-		while (!curl_result.valid())
-		{
-			if (m_order == WorkerOrder::Exit)
-				return false;
-
-			std::this_thread::sleep_for(std::chrono::milliseconds(1));
-		}
-
-		result = curl_result.get() == CURLE_OK;
-
-		delete fsUpdateFile;
-	}
-	else
-	{
-		cemuLog_log(LogType::Force, "Cemu zip download failed with error {}", r);
-		curl_easy_cleanup(curl);
-	}
+	m_gaugeMaxValue = 0;
+	const CURLcode curlResult = curl_easy_perform(curl);
+	long httpCode = 0;
+	curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
+	curl_easy_cleanup(curl);
+	fsUpdateFile.reset();
+	const bool result = curlResult == CURLE_OK && httpCode >= 200 && httpCode < 300;
+	if (!result)
+		cemuLog_log(LogType::Force, "Rift update download failed with CURL error {} and HTTP status {}", static_cast<int>(curlResult), httpCode);
 
 	if (!result && fs::exists(filename))
 	{
@@ -268,7 +337,7 @@ bool CemuUpdateWindow::DownloadCemuZip(const std::string& url, const fs::path& f
 		}
 		catch (const std::exception& ex)
 		{
-			cemuLog_log(LogType::Force, "can't remove update.zip on error: {}", ex.what());
+			cemuLog_log(LogType::Force, "Unable to remove the incomplete Rift update: {}", ex.what());
 		}
 	}
 	return result;
@@ -277,7 +346,6 @@ bool CemuUpdateWindow::DownloadCemuZip(const std::string& url, const fs::path& f
 bool CemuUpdateWindow::ExtractUpdate(const fs::path& zipname, const fs::path& targetpath, std::string& cemuFolderName)
 {
 	cemuFolderName.clear();
-	// open downloaded zip
 	int err;
 	auto* za = zip_open(zipname.string().c_str(), ZIP_RDONLY, &err);
 	if (za == nullptr)
@@ -291,44 +359,68 @@ bool CemuUpdateWindow::ExtractUpdate(const fs::path& zipname, const fs::path& ta
 	for (auto i = 0; i < count; i++)
 	{
 		if (m_order == WorkerOrder::Exit)
+		{
+			zip_close(za);
 			return false;
+		}
 
 		zip_stat_t sb{};
 		if (zip_stat_index(za, i, 0, &sb) == 0)
 		{
-			fs::path fname = targetpath;
-			fname /= sb.name;
-
 			const auto len = strlen(sb.name);
-			if (strcmp(sb.name, ".") == 0 || strcmp(sb.name, "..") == 0)
-			{
-				// protection
+			if (len == 0)
 				continue;
+
+			const fs::path relativePath = fs::path(sb.name).lexically_normal();
+			if (relativePath.empty() || relativePath.is_absolute())
+			{
+				zip_close(za);
+				return false;
 			}
+			for (const auto& component : relativePath)
+			{
+				if (component == "..")
+				{
+					zip_close(za);
+					return false;
+				}
+			}
+
+			const auto root = relativePath.begin();
+			if (root == relativePath.end())
+				continue;
+			const std::string rootName = root->string();
+			if (cemuFolderName.empty())
+				cemuFolderName = rootName;
+			else if (cemuFolderName != rootName)
+			{
+				cemuLog_log(LogType::Force, "Rift update archive has multiple root entries");
+				zip_close(za);
+				return false;
+			}
+
+			const fs::path fname = targetpath / relativePath;
 			if (sb.name[len - 1] == '/' || sb.name[len - 1] == '\\')
 			{
-				// directory
 				try
 				{
-					if (!exists(fname))
-						create_directory(fname);
+					create_directories(fname);
 				}
 				catch (const std::exception& ex)
 				{
 					SystemException sys(ex);
 					cemuLog_log(LogType::Force, "can't create folder \"{}\" for update: {}", sb.name, sys.what());
 				}
-				// the root should have only one Cemu_... directory, we track it here
-				if ((std::count(sb.name, sb.name + len, '/') + std::count(sb.name, sb.name + len, '\\')) == 1)
-				{
-					if (!cemuFolderName.empty())
-						cemuLog_log(LogType::Force, "update zip has multiple folders in root");
-					cemuFolderName.assign(sb.name, len - 1);
-				}
 				continue;
 			}
 
-			// file
+			if (std::distance(relativePath.begin(), relativePath.end()) < 2)
+			{
+				zip_close(za);
+				return false;
+			}
+			create_directories(fname.parent_path());
+
 			auto* zf = zip_fopen_index(za, i, 0);
 			if (!zf)
 			{
@@ -342,6 +434,7 @@ bool CemuUpdateWindow::ExtractUpdate(const fs::path& zipname, const fs::path& ta
 			if (read != (sint64)sb.size)
 			{
 				cemuLog_log(LogType::Force, "could only read 0x{:x} of 0x{:x} bytes from zip file \"{}\"", read, sb.size, sb.name);
+				zip_fclose(zf);
 				zip_close(za);
 				return false;
 			}
@@ -350,15 +443,21 @@ bool CemuUpdateWindow::ExtractUpdate(const fs::path& zipname, const fs::path& ta
 			if (file == nullptr)
 			{
 				cemuLog_log(LogType::Force, "can't create update file \"{}\"", sb.name);
+				zip_fclose(zf);
 				zip_close(za);
 				return false;
 			}
 
-			fwrite(buffer.data(), 1, buffer.size(), file);
+			const size_t written = fwrite(buffer.data(), 1, buffer.size(), file);
 			fflush(file);
 			fclose(file);
 
 			zip_fclose(zf);
+			if (written != buffer.size())
+			{
+				zip_close(za);
+				return false;
+			}
 
 			if ((i / 10) * 10 == i)
 			{
@@ -380,9 +479,8 @@ bool CemuUpdateWindow::ExtractUpdate(const fs::path& zipname, const fs::path& ta
 
 void CemuUpdateWindow::WorkerThread()
 {
-	const auto tmppath = fs::temp_directory_path() / L"cemu_update";
+	const auto tmppath = fs::temp_directory_path() / L"rift_update";
 	std::error_code ec;
-	// clean leftovers
 	if (exists(tmppath))
 		remove_all(tmppath, ec);
 
@@ -400,7 +498,7 @@ void CemuUpdateWindow::WorkerThread()
 			if (m_order == WorkerOrder::CheckVersion)
 			{
 				auto* event = new wxCommandEvent(wxEVT_RESULT);
-				if (QueryUpdateInfo(m_downloadUrl, m_changelogUrl))
+				if (QueryUpdateInfo(m_downloadUrl, m_changelogUrl, m_latestTag))
 					event->SetInt((int)Result::UpdateAvailable);
 				else
 					event->SetInt((int)Result::NoUpdateAvailable);
@@ -409,7 +507,6 @@ void CemuUpdateWindow::WorkerThread()
 			}
 			else if (m_order == WorkerOrder::UpdateVersion)
 			{
-				// download update
 				const std::string url = m_downloadUrl;
 				if (!exists(tmppath))
 					create_directory(tmppath);
@@ -438,18 +535,23 @@ void CemuUpdateWindow::WorkerThread()
 				if (m_order == WorkerOrder::Exit)
 					break;
 
-				// extract
 				std::string cemuFolderName;
 #if BOOST_OS_WINDOWS
 				if (!ExtractUpdate(update_file, tmppath, cemuFolderName))
 				{
-					cemuLog_log(LogType::Force, "Extracting Cemu zip failed");
-					break;
+					cemuLog_log(LogType::Force, "Extracting the Rift update failed");
+					auto* event = new wxCommandEvent(wxEVT_RESULT);
+					event->SetInt((int)Result::ExtractError);
+					wxQueueEvent(this, event);
+					continue;
 				}
 				if (cemuFolderName.empty())
 				{
-					cemuLog_log(LogType::Force, "Cemu folder not found in zip");
-					break;
+					cemuLog_log(LogType::Force, "Rift folder not found in the update archive");
+					auto* event = new wxCommandEvent(wxEVT_RESULT);
+					event->SetInt((int)Result::ExtractError);
+					wxQueueEvent(this, event);
+					continue;
 				}
 #endif
 				const auto expected_path = tmppath / cemuFolderName;
@@ -469,7 +571,7 @@ void CemuUpdateWindow::WorkerThread()
 					{
 						try
 						{
-							fs::remove(tmppath);
+							fs::remove_all(tmppath);
 						}
 						catch (const std::exception& ex)
 						{
@@ -484,18 +586,20 @@ void CemuUpdateWindow::WorkerThread()
 				if (m_order == WorkerOrder::Exit)
 					break;
 
-				// apply update
 				fs::path exePath = ActiveSettings::GetExecutablePath();
 #if BOOST_OS_WINDOWS
-				std::wstring target_directory = exePath.parent_path().generic_wstring();
-				if (target_directory[target_directory.size() - 1] == '/')
-					target_directory = target_directory.substr(0, target_directory.size() - 1); // remove trailing /
-
-				// get exe name
 				const auto exec = ActiveSettings::GetExecutablePath();
-				const auto target_exe = fs::path(exec).replace_extension("exe.backup");
-				fs::rename(exec, target_exe);
-				m_restartFile = exec;				
+				const auto stagedExecutable = expected_path / exec.filename();
+				if (!fs::is_regular_file(stagedExecutable))
+				{
+					cemuLog_log(LogType::Force, "Rift update archive does not contain {}", _pathToUtf8(exec.filename()));
+					auto* resultEvent = new wxCommandEvent(wxEVT_RESULT);
+					resultEvent->SetInt((int)Result::Error);
+					wxQueueEvent(this, resultEvent);
+					continue;
+				}
+
+				const auto backupExecutable = fs::path(exec).replace_extension("exe.backup");
 #elif BOOST_OS_LINUX
 				const char* appimage_path = std::getenv("APPIMAGE");
 				const auto target_exe = fs::path(appimage_path).replace_extension("AppImage.backup");
@@ -505,43 +609,53 @@ void CemuUpdateWindow::WorkerThread()
 				m_restartFile = appimage_path;
 				chmod(filePath, permissions);
 				wxString wxAppPath = wxString::FromUTF8(appimage_path);
-				wxCopyFile (wxT("/tmp/cemu_update/Cemu.AppImage"), wxAppPath);
+				wxCopyFile (wxT("/tmp/rift_update/Cemu.AppImage"), wxAppPath);
 #endif
 #if BOOST_OS_WINDOWS
-				const auto index = expected_path.wstring().size();
 				int counter = 0;
-				for (const auto& it : fs::recursive_directory_iterator(expected_path))
+				bool applySucceeded = true;
+				try
 				{
-					const auto filename = it.path().wstring().substr(index);
-					auto target_file = target_directory + filename;
-					try
-					{
-						if (is_directory(it))
-						{
-							if (!fs::exists(target_file))
-								fs::create_directory(target_file);
-						}
-						else
-						{
-							if (it.path().filename() == L"Cemu.exe")
-								fs::rename(it.path(), fs::path(target_file).replace_filename(exec.filename()));
-							else
-								fs::rename(it.path(), target_file);
-						}
-					}
-					catch (const std::exception& ex)
-					{
-						SystemException sys(ex);
-						cemuLog_log(LogType::Force, "applying update error: {}", sys.what());
-					}
+					if (fs::exists(backupExecutable))
+						fs::remove(backupExecutable);
+					fs::rename(exec, backupExecutable);
 
-					if ((counter++ % 10) == 0)
+					for (const auto& it : fs::recursive_directory_iterator(expected_path))
 					{
-						auto* event = new wxCommandEvent(wxEVT_PROGRESS);
-						event->SetInt(counter);
-						wxQueueEvent(this, event);
+						const auto relativePath = fs::relative(it.path(), expected_path);
+						const auto targetFile = exePath.parent_path() / relativePath;
+						if (is_directory(it))
+							fs::create_directories(targetFile);
+						else
+							fs::copy_file(it.path(), targetFile, fs::copy_options::overwrite_existing);
+
+						if ((counter++ % 10) == 0)
+						{
+							auto* event = new wxCommandEvent(wxEVT_PROGRESS);
+							event->SetInt(counter);
+							wxQueueEvent(this, event);
+						}
 					}
 				}
+				catch (const std::exception& ex)
+				{
+					SystemException sys(ex);
+					cemuLog_log(LogType::Force, "Applying the Rift update failed: {}", sys.what());
+					applySucceeded = false;
+				}
+
+				if (!applySucceeded)
+				{
+					if (fs::exists(exec))
+						fs::remove(exec);
+					if (fs::exists(backupExecutable))
+						fs::rename(backupExecutable, exec);
+					auto* resultEvent = new wxCommandEvent(wxEVT_RESULT);
+					resultEvent->SetInt((int)Result::Error);
+					wxQueueEvent(this, resultEvent);
+					continue;
+				}
+				m_restartFile = exec;
 #endif
 				auto* event = new wxCommandEvent(wxEVT_PROGRESS);
 				event->SetInt(m_gaugeMaxValue);
@@ -557,7 +671,6 @@ void CemuUpdateWindow::WorkerThread()
 			SystemException sys(ex);
 			cemuLog_log(LogType::Force, "update error: {}", sys.what());
 
-			// clean leftovers
 			if (exists(tmppath))
 				remove_all(tmppath, ec);
 
@@ -619,7 +732,7 @@ void CemuUpdateWindow::OnResult(wxCommandEvent& event)
 	{
 	case Result::NoUpdateAvailable:
 		m_cancelButton->SetLabel(_("Exit"));
-		m_text->SetLabel(_("No update available!"));
+		m_text->SetLabel(_("Rift Iteration ") + wxString::FromUTF8(RiftVersion::Iteration) + _(" is current."));
 		m_gauge->SetValue(100);
 		break;
 	case Result::UpdateAvailable:
@@ -634,7 +747,7 @@ void CemuUpdateWindow::OnResult(wxCommandEvent& event)
 
 		m_updateButton->Show();
 
-		m_text->SetLabel(_("Update available!"));
+		m_text->SetLabel(_("Rift ") + wxString::FromUTF8(m_latestTag) + _(" is available."));
 		m_cancelButton->SetLabel(_("Exit"));
 		break;
 	}
@@ -660,11 +773,15 @@ void CemuUpdateWindow::OnResult(wxCommandEvent& event)
 		m_cancelButton->Enable();
 		m_updateButton->Hide();
 
-		m_text->SetLabel(_("Success"));
+		m_text->SetLabel(_("Update installed. Restart Rift to finish."));
 		m_cancelButton->SetLabel(_("Restart"));
 		m_restartRequired = true;
 		break;
-	default:;
+	case Result::Error:
+		m_updateButton->Enable();
+		m_cancelButton->Enable();
+		m_text->SetLabel(_("The update could not be installed."));
+		break;
 	}
 }
 

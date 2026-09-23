@@ -214,12 +214,12 @@ wxPanel* GeneralSettings2::AddGeneralPage(wxNotebook* notebook)
 			CountRowElement();
 
 			m_auto_update = new wxCheckBox(box, wxID_ANY, _("Automatically check for updates"));
-			m_auto_update->SetToolTip(_("Automatically checks for new cemu versions on startup"));
+			m_auto_update->SetToolTip(_("Automatically checks GitHub for new Rift iterations on startup"));
 			second_row->Add(m_auto_update, 0, botflag, 5);
 			CountRowElement();
 
-			m_receive_untested_releases = new wxCheckBox(box, wxID_ANY, _("Receive untested updates"));
-			m_receive_untested_releases->SetToolTip(_("When checking for updates, include brand new and untested releases. These may contain bugs!"));
+			m_receive_untested_releases = new wxCheckBox(box, wxID_ANY, _("Include pre-release iterations"));
+			m_receive_untested_releases->SetToolTip(_("Include Rift releases marked as pre-releases. These may contain bugs."));
 			second_row->Add(m_receive_untested_releases, 0, botflag, 5);
 #if BOOST_OS_LINUX
 			if (!std::getenv("APPIMAGE")) {

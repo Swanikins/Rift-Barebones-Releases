@@ -30,7 +30,7 @@ private:
 	void OnGaugeUpdate(wxCommandEvent& event);
 
 	static size_t WriteStringCallback(char* ptr, size_t size, size_t nmemb, void* userdata);
-	static bool QueryUpdateInfo(std::string& downloadUrlOut, std::string& changelogUrlOut);
+	static bool QueryUpdateInfo(std::string& downloadUrlOut, std::string& changelogUrlOut, std::string& latestTagOut);
 	static bool CheckVersion();
 
 	static int ProgressCallback(void* clientp, curl_off_t dltotal, curl_off_t dlnow, curl_off_t ultotal, curl_off_t ulnow);
@@ -60,7 +60,7 @@ private:
 	WorkerOrder m_order = WorkerOrder::CheckVersion;
 	void WorkerThread();
 
-	std::string m_downloadUrl, m_changelogUrl;
+	std::string m_downloadUrl, m_changelogUrl, m_latestTag;
 	int m_gaugeMaxValue = 0;
 
 	std::thread m_thread;

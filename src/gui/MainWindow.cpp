@@ -1815,7 +1815,7 @@ void MainWindow::OnTimer(wxTimerEvent& event)
 	{
 		if(m_update_available.get())
 		{
-			wxMessageDialog dialog(this, _("There's a new update available.\nDo you want to update?"), _("Update notification"), wxCENTRE | wxYES_NO);
+			wxMessageDialog dialog(this, _("A new Rift iteration is available.\nDo you want to update?"), _("Rift update"), wxCENTRE | wxYES_NO);
 			if(dialog.ShowModal() == wxID_YES)
 			{
 				CemuUpdateWindow update_window(this);
