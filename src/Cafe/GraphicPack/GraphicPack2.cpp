@@ -63,35 +63,19 @@ void GraphicPack2::LoadGraphicPack(fs::path graphicPackPath)
 void GraphicPack2::LoadAll()
 {
 	std::error_code ec;
-	auto loadFromPath = [&ec](const fs::path& basePath, const fs::path& excludedPath = {})
+	fs::path basePath = ActiveSettings::GetUserDataPath("graphicPacks");
+	for (fs::recursive_directory_iterator it(basePath, ec); it != end(it); ++it)
 	{
-		ec.clear();
-		for (fs::recursive_directory_iterator it(basePath, ec); it != end(it); ++it)
+		if (!it->is_directory(ec))
+			continue;
+		fs::path gfxPackPath = it->path();
+		if (fs::exists(gfxPackPath / "rules.txt", ec))
 		{
-			if (!it->is_directory(ec))
-				continue;
-			fs::path gfxPackPath = it->path();
-			if (!excludedPath.empty() && gfxPackPath.lexically_normal() == excludedPath.lexically_normal())
-			{
-				it.disable_recursion_pending();
-				continue;
-			}
-			if (fs::exists(gfxPackPath / "rules.txt", ec))
-			{
-				LoadGraphicPack(gfxPackPath);
-				it.disable_recursion_pending(); // dont recurse deeper in a gfx pack directory
-			}
+			LoadGraphicPack(gfxPackPath);
+			it.disable_recursion_pending(); // dont recurse deeper in a gfx pack directory
+			continue;
 		}
-	};
-
-	// Load user/community packs first so their enabled state and preset choices are
-	// available to the migration step below. Rift's curated revisions are loaded
-	// afterwards: when they supersede the same virtual pack, the newer files win
-	// while the user's choices are copied onto them.
-	const fs::path bundledPath = ActiveSettings::GetDataPath("graphicPacks") / "rift-bundled";
-	const fs::path userPath = ActiveSettings::GetUserDataPath("graphicPacks");
-	loadFromPath(userPath, bundledPath);
-	loadFromPath(bundledPath);
+	}
 }
 
 bool GraphicPack2::LoadGraphicPack(const fs::path& rulesPath, IniParser& rules)
@@ -99,60 +83,34 @@ bool GraphicPack2::LoadGraphicPack(const fs::path& rulesPath, IniParser& rules)
 	try
 	{
 		auto gp = std::make_shared<GraphicPack2>(rulesPath, rules);
-		const auto& configEntries = g_config.data().graphic_pack_entries;
-		auto configuredState = configEntries.find(gp->GetRulesPath().lexically_normal());
-		if (configuredState == configEntries.cend())
-			configuredState = configEntries.find(_utf8ToPath(gp->GetNormalizedPathString()));
-		if (configuredState == configEntries.cend() && gp->IsRiftBundledRevision())
+
+		// check if enabled and preset set
+		const auto& config_entries = g_config.data().graphic_pack_entries;
+
+		// legacy absolute path checking for not breaking compatibility
+		auto file = gp->GetRulesPath();
+		auto it = config_entries.find(file.lexically_normal());
+		if (it == config_entries.cend())
 		{
-			const auto legacyPath = MakeRelativePath(ActiveSettings::GetUserDataPath(), gp->GetRulesPath()).lexically_normal();
-			configuredState = configEntries.find(legacyPath);
+			// check for relative path
+			it = config_entries.find(_utf8ToPath(gp->GetNormalizedPathString()));
 		}
-		const bool restoredState = configuredState != configEntries.cend();
-		if (restoredState)
+
+		if (it != config_entries.cend())
 		{
 			bool enabled = true;
-			for (const auto& [category, preset] : configuredState->second)
+			for (auto& kv : it->second)
 			{
-				if (boost::iequals(category, "_disabled"))
-					enabled = false;
-				else
-					gp->SetActivePreset(category, preset, false);
-			}
-			gp->SetEnabled(enabled);
-		}
-
-		auto duplicate = std::find_if(s_graphic_packs.begin(), s_graphic_packs.end(),
-			[&gp](const GraphicPackPtr& loaded) {
-				return boost::iequals(loaded->GetVirtualPath(), gp->GetVirtualPath());
-			});
-		if (duplicate != s_graphic_packs.end())
-		{
-			if (!gp->IsRiftBundledRevision())
-			{
-				cemuLog_log(LogType::Force, "Skipping duplicate graphic pack '{}' from {}",
-					gp->GetVirtualPath(), _pathToUtf8(rulesPath));
-				return false;
-			}
-
-			uint32 migratedPresets = 0;
-			if (!restoredState)
-			{
-				const auto previous = *duplicate;
-				for (const auto& preset : previous->GetActivePresets())
+				if (boost::iequals(kv.first, "_disabled"))
 				{
-					if (gp->SetActivePreset(preset->category, preset->name, false))
-						++migratedPresets;
+					enabled = false;
+					continue;
 				}
-				gp->SetEnabled(previous->IsEnabled());
+
+				gp->SetActivePreset(kv.first, kv.second, false);
 			}
-			gp->UpdatePresetVisibility();
-			gp->ValidatePresetSelections();
-			*duplicate = gp;
-			cemuLog_log(LogType::Force,
-				"Loaded Rift graphic pack '{}' with {} state and {} migrated preset selection(s)",
-				gp->GetVirtualPath(), restoredState ? "saved" : "migrated", migratedPresets);
-			return false;
+
+			gp->SetEnabled(enabled);
 		}
 
 		gp->UpdatePresetVisibility();
@@ -563,30 +521,7 @@ bool GraphicPack2::Reload()
 
 std::string GraphicPack2::GetNormalizedPathString() const
 {
-	if (IsRiftBundledRevision())
-	{
-		fs::path stablePath = "graphicPacks";
-		bool append = false;
-		for (const auto& component : GetRulesPath())
-		{
-			if (!append && boost::iequals(_pathToUtf8(component), "rift-bundled"))
-			{
-				stablePath /= "rift-bundled";
-				append = true;
-			}
-			else if (append)
-				stablePath /= component;
-		}
-		return _pathToUtf8(stablePath.lexically_normal());
-	}
 	return _pathToUtf8(MakeRelativePath(ActiveSettings::GetUserDataPath(), GetRulesPath()).lexically_normal());
-}
-
-bool GraphicPack2::IsRiftBundledRevision() const
-{
-	return std::any_of(m_rulesPath.begin(), m_rulesPath.end(), [](const fs::path& component) {
-		return boost::iequals(_pathToUtf8(component), "rift-bundled");
-	});
 }
 
 bool GraphicPack2::ContainsTitleId(uint64_t title_id) const

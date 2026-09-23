@@ -54,17 +54,6 @@ if ($LASTEXITCODE -ne 0) { throw 'Rift configuration failed.' }
 & $cmakePath --build $buildPath --target CemuBin --config Release --parallel 4
 if ($LASTEXITCODE -ne 0) { throw 'Rift compilation failed.' }
 
-$bundledPackSource = "$buildRoot/bundled_graphic_packs"
-$bundledPackDestination = "$buildRoot/bin/graphicPacks/rift-bundled"
-if (Test-Path -LiteralPath $bundledPackDestination) {
-    Remove-Item -LiteralPath $bundledPackDestination -Recurse -Force
-}
-New-Item -ItemType Directory -Path $bundledPackDestination -Force | Out-Null
-Copy-Item -LiteralPath "$bundledPackSource/LICENSE.md" -Destination $bundledPackDestination -Force
-Copy-Item -LiteralPath "$bundledPackSource/CREDITS.md" -Destination $bundledPackDestination -Force
-Copy-Item -LiteralPath "$bundledPackSource/src/SkylandersSwapForce" -Destination $bundledPackDestination -Recurse -Force
-Copy-Item -LiteralPath "$bundledPackSource/src/SkylandersTrapTeam" -Destination $bundledPackDestination -Recurse -Force
-
 $executable = Join-Path $buildRoot "bin/$OutputName.exe"
 if (-not (Test-Path -LiteralPath $executable)) { throw "The build completed but $OutputName.exe was not found in the bin folder." }
 Write-Host "Built $executable"

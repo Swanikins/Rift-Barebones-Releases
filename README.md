@@ -26,7 +26,7 @@ Controller setup is saved automatically. Named profiles are optional copies, whi
 3. Run `Rift-Barebones.exe`.
 4. Open **Options > General settings**. Add the folder containing your legally dumped Wii U games, then choose the included `skylanders` folder or your existing `.sky` collection folder.
 5. Open **Options > Input settings**, choose the Wii U controller type and physical input device for Player 1, and map the required buttons. The active setup saves automatically.
-6. Open **Options > Graphic packs**, select your Skylanders game, and enable the included graphic packs you want to use. (Best if playing SF or TT. Big thank you to FrankyBuster for updating and improving these two game's graphic packs)
+6. Open **Options > Graphic packs**, click **Download latest community graphic packs**, select your Skylanders game, and enable the graphic packs you want to use. (Best if playing SF or TT. Big thank you to FrankyBuster for updating and improving these two game's graphic packs)
 7. Start your Skylanders game.
 8. Open **Settings** inside Rift and select either Virtual Portal or Physical Portal. You can also adjust a handful of things here.
 9. Press **F7** to open the in-game Rift of Power. With a controller, press **R + D-pad Down** to open or close it. Press **F8** to open the original desktop manager, which i'm like 75% sure is broken and not needed. But I just want to get Rift published already.
@@ -84,5 +84,5 @@ The repository does not include games, title keys, firmware, or figure dumps. Pa
 
 ## Disclosure
 
-Rift Barebones is based on [Cemu](https://github.com/cemu-project/Cemu). Cemu and modified MPL-covered files are distributed under the [Mozilla Public License 2.0](LICENSE.txt). Files under `dependencies` retain their own licenses, and bundled graphic packs and interface assets retain the notices included with them. Packaged figure portraits and modified catalog data are attributed in [the third-party data and asset notices](assets/THIRD_PARTY_NOTICES.md).
+Rift Barebones is based on [Cemu](https://github.com/cemu-project/Cemu). Cemu and modified MPL-covered files are distributed under the [Mozilla Public License 2.0](LICENSE.txt). Files under `dependencies` retain their own licenses, and interface assets retain the notices included with them. Packaged figure portraits and modified catalog data are attributed in [the third-party data and asset notices](assets/THIRD_PARTY_NOTICES.md).
 AI-assisted tools were used during portions of implementation and documentation. The maintainer (me) is responsible for reviewing, testing, and publishing the resulting work. Rift is in active development. It is not affiliated with or endorsed by the Cemu project, Activision, Toys for Bob, Microsoft, or Nintendo. Skylanders and related names remain the property of their respective owners. (I need to put this here to protect my own butt from several *entitys*, It's kind of unavoidable nowadays.)

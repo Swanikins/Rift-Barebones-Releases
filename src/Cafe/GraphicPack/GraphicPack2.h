@@ -175,8 +175,6 @@ public:
 	static void Reset();
 
 private:
-	bool IsRiftBundledRevision() const;
-
 	bool Activate();
 	bool Deactivate();
 
