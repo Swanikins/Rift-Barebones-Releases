@@ -453,7 +453,7 @@ namespace nsyshid
 			{{3238, 0x4402}, "Power Blue Splatter Splasher"},
 			{{3239, 0x0000}, "Soda Skimmer"},
 			{{3239, 0x4402}, "Nitro Soda Skimmer"},
-			{{3240, 0x0000}, "Barrel Blaster (Nintendo Only)"},
+			{{3240, 0x4000}, "Barrel Blaster (Nintendo Only)"},
 			{{3240, 0x4402}, "Dark Barrel Blaster (Nintendo Only)"},
 			{{3241, 0x0000}, "Buzz Wing"},
 			{{3400, 0x0000}, "Fiesta"},

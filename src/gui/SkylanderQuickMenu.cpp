@@ -50,8 +50,16 @@ namespace
 	{
 		Header,
 		Portal,
+		Search,
 		ElementFilter,
 		Library
+	};
+
+	enum class SearchTarget
+	{
+		None,
+		Collection,
+		Create
 	};
 
 	enum class SortMode : sint32
@@ -61,6 +69,15 @@ namespace
 		FavoritesFirst,
 		NewestFiles,
 		FavoritesOnly,
+		Element,
+		FigureType,
+		Count
+	};
+
+	enum class ForgeSortMode : sint32
+	{
+		NameAscending,
+		NameDescending,
 		Element,
 		FigureType,
 		Count
@@ -152,6 +169,12 @@ namespace
 		int selectedElementFilter{};
 		int selectedPortalRow{};
 		int selectedDefinition{};
+		int forgeSortMode{};
+		int forgeTypeFilter{};
+		int forgeElementFilter{};
+		int forgeToolbarSelection{};
+		int keyboardRow{};
+		int keyboardColumn{};
 		int selectedOption{};
 		int selectedLibraryOption{};
 		int headerSelection{};
@@ -160,6 +183,8 @@ namespace
 		RiftPage page{RiftPage::Dashboard};
 		RiftPage renderedPage{RiftPage::Dashboard};
 		FocusArea focus{FocusArea::Library};
+		SearchTarget searchTarget{SearchTarget::None};
+		bool forgeToolbarFocused{};
 		ImVec2 selectedCardCenter{};
 		std::array<ImVec2, kPortalCapacity> portalTargets{};
 		std::array<float, kPortalCapacity + 1> portalCardX{};
@@ -174,6 +199,7 @@ namespace
 		ImU32 placementAccent{IM_COL32(71, 207, 255, 255)};
 		std::string toast;
 		std::array<char, 96> searchText{};
+		std::array<char, 96> forgeSearchText{};
 		std::chrono::steady_clock::time_point hapticStop{};
 		skylander_ui::SkylanderCatalog catalog;
 		std::vector<skylander_ui::CollectionFigure> library;
@@ -183,6 +209,7 @@ namespace
 
 	std::atomic_uint32_t s_toggleRequests{};
 	std::atomic_bool s_resetRequested{};
+	std::atomic_bool s_updateCheckRequested{};
 	std::unordered_map<std::string, ArtworkTexture> s_artworkTextures;
 	std::unordered_map<std::string, float> s_cardFocusAmounts;
 	std::unordered_map<std::string, float> s_cardCarouselOffsets;
@@ -591,12 +618,15 @@ namespace
 					LoadedArtwork artwork;
 					artwork.entry.key = std::move(key);
 					std::error_code pathError;
-					if (fs::is_regular_file(path, pathError))
+					const bool readableFile = fs::is_regular_file(path, pathError) && !pathError;
+					const uintmax_t sourceSize = readableFile ? fs::file_size(path, pathError) : 0;
+					if (readableFile && !pathError && sourceSize <= 8 * 1024 * 1024)
 					{
 						wxLogNull suppressImageErrors;
 						wxImage image;
 						if (image.LoadFile(path.wstring()) && image.IsOk() && image.GetData() &&
-							image.GetWidth() > 0 && image.GetHeight() > 0)
+							image.GetWidth() > 0 && image.GetHeight() > 0 &&
+							image.GetWidth() <= 4096 && image.GetHeight() <= 4096)
 						{
 							constexpr int kThumbnailWidth = 192;
 							constexpr int kThumbnailHeight = 256;
@@ -791,6 +821,28 @@ namespace
 			text.data(), text.data() + text.size());
 	}
 
+	void DrawShadowedText(ImDrawList* draw, ImVec2 position, ImU32 color, float size,
+		std::string_view text, float scale)
+	{
+		const float alpha = static_cast<float>((color >> 24) & 0xFF) / 255.0f;
+		DrawText(draw, {position.x + 4.0f * scale, position.y + 5.0f * scale},
+			WithAlpha(IM_COL32(0, 2, 10, 255), alpha * 0.30f), size, text);
+		DrawText(draw, {position.x + 2.0f * scale, position.y + 3.0f * scale},
+			WithAlpha(IM_COL32(0, 2, 10, 255), alpha * 0.72f), size, text);
+		DrawText(draw, position, color, size, text);
+	}
+
+	void DrawShadowedTextRightAligned(ImDrawList* draw, ImVec2 right, ImU32 color, float size,
+		std::string_view text, float scale)
+	{
+		const float alpha = static_cast<float>((color >> 24) & 0xFF) / 255.0f;
+		DrawTextRightAligned(draw, {right.x + 4.0f * scale, right.y + 5.0f * scale},
+			WithAlpha(IM_COL32(0, 2, 10, 255), alpha * 0.30f), size, text);
+		DrawTextRightAligned(draw, {right.x + 2.0f * scale, right.y + 3.0f * scale},
+			WithAlpha(IM_COL32(0, 2, 10, 255), alpha * 0.72f), size, text);
+		DrawTextRightAligned(draw, right, color, size, text);
+	}
+
 	void DrawGlow(ImDrawList* draw, ImVec2 center, float radius, ImU32 color, float alpha)
 	{
 		const int bloom = BloomLevel();
@@ -857,6 +909,31 @@ namespace
 			radius, 0, 1.2f * layout.scale);
 	}
 
+	void DrawElevatedSurface(ImDrawList* draw, const RiftLayout& layout, ImVec2 minimum, ImVec2 maximum,
+		bool active = false, ImU32 accent = 0)
+	{
+		const auto theme = CurrentTheme();
+		if (!accent)
+			accent = theme.accent;
+		const float radius = CornerRadius(5.0f) * layout.scale;
+		for (int layer = 3; layer >= 1; --layer)
+		{
+			const float offsetX = DrawerWidth(layout, 1.0f + layer * 1.2f);
+			const float offsetY = (2.0f + layer * 1.7f) * layout.scale;
+			draw->AddRectFilled({minimum.x + offsetX, minimum.y + offsetY},
+				{maximum.x + offsetX, maximum.y + offsetY},
+				WithAlpha(IM_COL32(0, 2, 10, 255), layout.alpha * (0.055f + layer * 0.035f)), radius);
+		}
+		draw->AddRectFilled(minimum, maximum,
+			WithAlpha(active ? theme.selectedSurface : theme.surface, layout.alpha * (active ? 0.92f : 0.78f)), radius);
+		draw->AddLine({minimum.x + radius, minimum.y + layout.scale},
+			{maximum.x - radius, minimum.y + layout.scale},
+			WithAlpha(theme.text, layout.alpha * (active ? 0.18f : 0.11f)), layout.scale);
+		draw->AddRect(minimum, maximum,
+			WithAlpha(active ? accent : theme.border, layout.alpha * (active ? 0.72f : 0.36f)),
+			radius, 0, (active ? 1.5f : 1.0f) * layout.scale);
+	}
+
 	struct CardGeometry
 	{
 		ImVec2 p0{};
@@ -889,7 +966,6 @@ namespace
 		const ImU32 accent = texture.id ? texture.accent : CurrentTheme().accent;
 		const int effect = std::clamp<sint32>(GetConfig().emulated_usb_devices.skylander_card_effect.GetValue(), 0, 3);
 		const int borderStyle = std::clamp<sint32>(GetConfig().emulated_usb_devices.skylander_card_border.GetValue(), 0, 3);
-		const int textureStyle = std::clamp<sint32>(GetConfig().emulated_usb_devices.skylander_card_texture.GetValue(), 0, 3);
 		for (int layer = 6; layer >= 1; --layer)
 		{
 			const float offsetX = 1.0f + layer * 0.85f;
@@ -912,32 +988,6 @@ namespace
 				texture.uvMinimum, {texture.uvMaximum.x, texture.uvMinimum.y},
 				texture.uvMaximum, {texture.uvMinimum.x, texture.uvMaximum.y},
 				WithAlpha(IM_COL32_WHITE, alpha));
-			if (textureStyle > 0)
-			{
-				const int scanlines = textureStyle == 1 ? 12 : textureStyle == 2 ? 18 : 24;
-				for (int line = 1; line < scanlines; ++line)
-				{
-					const float t = static_cast<float>(line) / scanlines;
-					const ImVec2 left{card.p0.x + (card.p3.x - card.p0.x) * t,
-						card.p0.y + (card.p3.y - card.p0.y) * t};
-					const ImVec2 right{card.p1.x + (card.p2.x - card.p1.x) * t,
-						card.p1.y + (card.p2.y - card.p1.y) * t};
-					const bool bright = (line & 1) == 0;
-					draw->AddLine(left, right, WithAlpha(bright ? IM_COL32_WHITE : IM_COL32(3, 8, 16, 255),
-						alpha * (textureStyle == 1 ? 0.025f : textureStyle == 2 ? 0.045f : 0.065f)), 1.0f);
-					if (textureStyle >= 2 && bright)
-					{
-						const int dots = textureStyle == 2 ? 6 : 9;
-						for (int dot = 1; dot < dots; ++dot)
-						{
-							const float u = (dot + (line & 3) * 0.25f) / dots;
-							const ImVec2 point{left.x + (right.x - left.x) * u, left.y + (right.y - left.y) * u};
-							draw->AddCircleFilled(point, textureStyle == 3 ? 0.9f : 0.65f,
-								WithAlpha(IM_COL32(4, 10, 18, 255), alpha * 0.16f), 6);
-						}
-					}
-				}
-			}
 			if (focus > 0.001f && effect == 3)
 			{
 				const float shimmer = 0.5f + 0.5f * std::sin(static_cast<float>(ImGui::GetTime()) * 1.7f);
@@ -1020,9 +1070,19 @@ namespace
 			EmulatedController::SetRiftInputCaptured(true);
 		}
 		else
+		{
+			s_menu.searchTarget = SearchTarget::None;
 			s_menu.reloadCatalog = true;
+		}
 		if (pulse)
 			PulseHaptics(open ? UiSound::Open : UiSound::Back);
+	}
+
+	void RequestUpdateCheck()
+	{
+		SetMenuOpen(false, false);
+		s_updateCheckRequested.store(true, std::memory_order_release);
+		PulseHaptics(UiSound::Confirm);
 	}
 
 	void ResetMenuInteraction()
@@ -1034,6 +1094,8 @@ namespace
 		s_menu.openChordBlockedUntilRelease = false;
 		s_menu.neutralInputFrames = 0;
 		s_menu.visibility = 0.0f;
+		s_menu.searchTarget = SearchTarget::None;
+		s_menu.forgeToolbarFocused = false;
 		s_menu.backWasDown = false;
 		s_menu.upWasDown = false;
 		s_menu.downWasDown = false;
@@ -1528,6 +1590,244 @@ namespace
 		}
 	}
 
+	std::string_view FigureTypeName(skylander_ui::FigureType type)
+	{
+		using skylander_ui::FigureType;
+		switch (type)
+		{
+		case FigureType::Skylander: return "SKYLANDER";
+		case FigureType::Trap: return "TRAP";
+		case FigureType::Vehicle: return "VEHICLE";
+		case FigureType::Item: return "ITEM";
+		case FigureType::CreationCrystal: return "CRYSTAL";
+		case FigureType::RacingDriver: return "DRIVER";
+		default: return "OTHER";
+		}
+	}
+
+	std::string_view ForgeSortName()
+	{
+		switch (static_cast<ForgeSortMode>(s_menu.forgeSortMode))
+		{
+		case ForgeSortMode::NameDescending: return "NAME Z-A";
+		case ForgeSortMode::Element: return "ELEMENT";
+		case ForgeSortMode::FigureType: return "FIGURE TYPE";
+		default: return "NAME A-Z";
+		}
+	}
+
+	std::string_view ForgeTypeFilterName()
+	{
+		switch (s_menu.forgeTypeFilter)
+		{
+		case 1: return "SKYLANDERS";
+		case 2: return "TRAPS";
+		case 3: return "VEHICLES";
+		case 4: return "ITEMS";
+		default: return "ALL TYPES";
+		}
+	}
+
+	bool MatchesForgeType(skylander_ui::FigureType type)
+	{
+		using skylander_ui::FigureType;
+		switch (s_menu.forgeTypeFilter)
+		{
+		case 1: return type == FigureType::Skylander;
+		case 2: return type == FigureType::Trap;
+		case 3: return type == FigureType::Vehicle;
+		case 4: return type == FigureType::Item || type == FigureType::CreationCrystal ||
+				type == FigureType::RacingDriver;
+		default: return true;
+		}
+	}
+
+	std::vector<const skylander_ui::FigureDefinition*> BuildForgeDefinitions()
+	{
+		std::vector<const skylander_ui::FigureDefinition*> filtered;
+		const auto& definitions = s_menu.catalog.GetCreatableDefinitions();
+		filtered.reserve(definitions.size());
+		const std::string query = Lowercase(s_menu.forgeSearchText.data());
+		for (const auto& definition : definitions)
+		{
+			if (s_menu.forgeElementFilter != 0 &&
+				definition.element != ElementForChoice(s_menu.forgeElementFilter))
+				continue;
+			if (!MatchesForgeType(definition.type))
+				continue;
+			const std::string haystack = Lowercase(fmt::format("{} {} {} {:04X} {:04X}",
+				definition.name, ElementName(definition.element), FigureTypeName(definition.type),
+				definition.id, definition.variant));
+			if (!query.empty() && haystack.find(query) == std::string::npos)
+				continue;
+			filtered.emplace_back(&definition);
+		}
+		auto byName = [](const auto* lhs, const auto* rhs) {
+			return std::tuple{Lowercase(lhs->name), lhs->id, lhs->variant} <
+				std::tuple{Lowercase(rhs->name), rhs->id, rhs->variant};
+		};
+		switch (static_cast<ForgeSortMode>(s_menu.forgeSortMode))
+		{
+		case ForgeSortMode::NameDescending:
+			std::sort(filtered.begin(), filtered.end(), [&](const auto* lhs, const auto* rhs) {
+				return byName(rhs, lhs);
+			});
+			break;
+		case ForgeSortMode::Element:
+			std::sort(filtered.begin(), filtered.end(), [&](const auto* lhs, const auto* rhs) {
+				const auto left = std::tuple{ElementRank(lhs->element), Lowercase(lhs->name), lhs->id, lhs->variant};
+				const auto right = std::tuple{ElementRank(rhs->element), Lowercase(rhs->name), rhs->id, rhs->variant};
+				return left < right;
+			});
+			break;
+		case ForgeSortMode::FigureType:
+			std::sort(filtered.begin(), filtered.end(), [&](const auto* lhs, const auto* rhs) {
+				const auto left = std::tuple{FigureTypeRank(lhs->type), Lowercase(lhs->name), lhs->id, lhs->variant};
+				const auto right = std::tuple{FigureTypeRank(rhs->type), Lowercase(rhs->name), rhs->id, rhs->variant};
+				return left < right;
+			});
+			break;
+		default:
+			std::sort(filtered.begin(), filtered.end(), byName);
+			break;
+		}
+		return filtered;
+	}
+
+	void CycleForgeSort()
+	{
+		s_menu.forgeSortMode = WrapChoice(s_menu.forgeSortMode + 1, static_cast<int>(ForgeSortMode::Count));
+		s_menu.selectedDefinition = 0;
+		SetToast("CREATE SORT: " + std::string(ForgeSortName()), 1.5f);
+		PulseHaptics();
+	}
+
+	void CycleForgeTypeFilter()
+	{
+		s_menu.forgeTypeFilter = WrapChoice(s_menu.forgeTypeFilter + 1, 5);
+		s_menu.selectedDefinition = 0;
+		SetToast("CREATE TYPE: " + std::string(ForgeTypeFilterName()), 1.5f);
+		PulseHaptics();
+	}
+
+	void CycleForgeElementFilter()
+	{
+		s_menu.forgeElementFilter = WrapChoice(s_menu.forgeElementFilter + 1, 12);
+		s_menu.selectedDefinition = 0;
+		SetToast("CREATE ELEMENT: " + std::string(ElementChoiceName(s_menu.forgeElementFilter, "ALL")), 1.5f);
+		PulseHaptics();
+	}
+
+	void ResetForgeFilters()
+	{
+		s_menu.forgeSearchText.fill(0);
+		s_menu.forgeTypeFilter = 0;
+		s_menu.forgeElementFilter = 0;
+		s_menu.selectedDefinition = 0;
+		SetToast("CREATE FILTERS CLEARED", 1.5f);
+		PulseHaptics();
+	}
+
+	std::array<char, 96>& ActiveSearchText()
+	{
+		return s_menu.searchTarget == SearchTarget::Create ? s_menu.forgeSearchText : s_menu.searchText;
+	}
+
+	const std::array<std::string_view, 4>& KeyboardCharacterRows()
+	{
+		static constexpr std::array<std::string_view, 4> rows{
+			"QWERTYUIOP", "ASDFGHJKL", "ZXCVBNM", "1234567890"};
+		return rows;
+	}
+
+	int KeyboardColumnCount(int row)
+	{
+		return row == 4 ? 4 : static_cast<int>(KeyboardCharacterRows()[std::clamp(row, 0, 3)].size());
+	}
+
+	void SearchTextChanged()
+	{
+		if (s_menu.searchTarget == SearchTarget::Collection)
+			RebuildLibrary();
+		else
+			s_menu.selectedDefinition = 0;
+	}
+
+	void OpenSearchKeyboard(SearchTarget target)
+	{
+		s_menu.searchTarget = target;
+		s_menu.keyboardRow = 0;
+		s_menu.keyboardColumn = 0;
+		PulseHaptics(UiSound::Confirm);
+	}
+
+	void CloseSearchKeyboard()
+	{
+		s_menu.searchTarget = SearchTarget::None;
+		PulseHaptics(UiSound::Back);
+	}
+
+	void BackspaceSearchText()
+	{
+		auto& text = ActiveSearchText();
+		const size_t length = std::char_traits<char>::length(text.data());
+		if (length == 0)
+			return;
+		text[length - 1] = '\0';
+		SearchTextChanged();
+		PulseHaptics();
+	}
+
+	void AppendSearchCharacter(char character)
+	{
+		auto& text = ActiveSearchText();
+		const size_t length = std::char_traits<char>::length(text.data());
+		if (length + 1 >= text.size())
+			return;
+		text[length] = character;
+		text[length + 1] = '\0';
+		SearchTextChanged();
+		PulseHaptics();
+	}
+
+	void ActivateKeyboardKey()
+	{
+		if (s_menu.keyboardRow < 4)
+		{
+			const auto row = KeyboardCharacterRows()[s_menu.keyboardRow];
+			AppendSearchCharacter(row[std::clamp(s_menu.keyboardColumn, 0, static_cast<int>(row.size()) - 1)]);
+			return;
+		}
+		switch (s_menu.keyboardColumn)
+		{
+		case 0: AppendSearchCharacter(' '); break;
+		case 1: BackspaceSearchText(); break;
+		case 2:
+			ActiveSearchText().fill(0);
+			SearchTextChanged();
+			PulseHaptics();
+			break;
+		default: CloseSearchKeyboard(); break;
+		}
+	}
+
+	void MoveKeyboardHorizontal(int direction)
+	{
+		const int count = KeyboardColumnCount(s_menu.keyboardRow);
+		s_menu.keyboardColumn = WrapChoice(s_menu.keyboardColumn + direction, count);
+		PulseHaptics();
+	}
+
+	void MoveKeyboardVertical(int direction)
+	{
+		const int oldCount = KeyboardColumnCount(s_menu.keyboardRow);
+		const float position = oldCount > 1 ? static_cast<float>(s_menu.keyboardColumn) / (oldCount - 1) : 0.0f;
+		s_menu.keyboardRow = WrapChoice(s_menu.keyboardRow + direction, 5);
+		const int newCount = KeyboardColumnCount(s_menu.keyboardRow);
+		s_menu.keyboardColumn = static_cast<int>(std::round(position * (newCount - 1)));
+		PulseHaptics();
+	}
+
 	int TargetPortalRow()
 	{
 		const auto rows = BuildPortalRows();
@@ -1647,12 +1947,12 @@ namespace
 			PulseHaptics(UiSound::Back);
 			return;
 		}
-		const auto& definitions = s_menu.catalog.GetCreatableDefinitions();
+		const auto definitions = BuildForgeDefinitions();
 		if (definitions.empty())
 			return;
 		s_menu.selectedDefinition = std::clamp(s_menu.selectedDefinition, 0,
 			static_cast<int>(definitions.size()) - 1);
-		const auto& figure = definitions[s_menu.selectedDefinition];
+		const auto& figure = *definitions[s_menu.selectedDefinition];
 		const bool created = CreateFigure(figure);
 		if (created)
 		{
@@ -1810,18 +2110,6 @@ namespace
 			draw->AddCircleFilled(Point(layout, x, y), (mote % 3 == 0 ? 1.2f : 0.75f) * layout.scale,
 				WithAlpha(moteColor, layout.alpha * (mote % 4 == 0 ? 0.17f : 0.09f)), 8);
 		}
-		for (int rune = 0; rune < 7; ++rune)
-		{
-			const ImVec2 runeCenter = Point(layout, 380.0f + static_cast<float>((rune * 137) % 820),
-				104.0f + static_cast<float>((rune * 211) % 520));
-			const float size = (8.0f + (rune % 3) * 3.0f) * layout.scale;
-			const ImU32 runeColor = WithAlpha(rune % 2 ? theme.secondary : theme.accent, layout.alpha * 0.055f);
-			draw->AddLine({runeCenter.x - size, runeCenter.y - size * 0.55f},
-				{runeCenter.x, runeCenter.y + size}, runeColor, 1.2f * layout.scale);
-			draw->AddLine({runeCenter.x, runeCenter.y + size},
-				{runeCenter.x + size, runeCenter.y - size * 0.55f}, runeColor, 1.2f * layout.scale);
-			draw->AddCircle(runeCenter, size * 0.24f, runeColor, 4, 1.1f * layout.scale);
-		}
 		draw->AddLine(Point(layout, kDrawerX + 8.0f, 1.0f), Point(layout, 1272.0f, 1.0f),
 			WithAlpha(IM_COL32(189, 227, 248, 255), layout.alpha * 0.12f), layout.scale);
 		draw->AddLine({shellMinimum.x, shellMinimum.y + 2.0f * layout.scale},
@@ -1843,6 +2131,7 @@ namespace
 		case 1: SetPortalMode(false); PulseHaptics(UiSound::Confirm); break;
 		case 2:
 			s_menu.page = RiftPage::Forge;
+			s_menu.forgeToolbarFocused = false;
 			PulseHaptics(UiSound::Confirm);
 			break;
 		case 3:
@@ -1902,10 +2191,10 @@ namespace
 			29.0f * layout.scale, "RIFT");
 		draw->AddRectFilled(Point(layout, 321, 63), Point(layout, 375, 65),
 			WithAlpha(wordmarkColor, layout.alpha * 0.88f), 1.0f * layout.scale);
-		DrawTextRightAligned(draw, Point(layout, 1244, 31), WithAlpha(portalColor, layout.alpha),
-			11.0f * layout.scale, virtualPortal ? "VIRTUAL PORTAL" : "PHYSICAL PORTAL");
-		DrawTextRightAligned(draw, Point(layout, 1244, 49), WithAlpha(CurrentTheme().text, layout.alpha),
-			13.0f * layout.scale, virtualPortal ? "LOCAL COLLECTION" : "USB PASSTHROUGH");
+		DrawShadowedTextRightAligned(draw, Point(layout, 1244, 31), WithAlpha(portalColor, layout.alpha),
+			11.0f * layout.scale, virtualPortal ? "VIRTUAL PORTAL" : "PHYSICAL PORTAL", layout.scale);
+		DrawShadowedTextRightAligned(draw, Point(layout, 1244, 49), WithAlpha(CurrentTheme().text, layout.alpha),
+			13.0f * layout.scale, virtualPortal ? "LOCAL COLLECTION" : "USB PASSTHROUGH", layout.scale);
 
 		draw->AddRect(Point(layout, 790, 77), Point(layout, 1244, 113),
 			WithAlpha(IM_COL32(147, 190, 217, 255), layout.alpha * 0.26f), 4.0f * layout.scale);
@@ -2081,6 +2370,8 @@ namespace
 			WithAlpha(CurrentTheme().border, layout.alpha * 0.22f), layout.scale);
 		const ImVec2 searchMin = Point(layout, 334, 330);
 		const ImVec2 searchMax = Point(layout, 650, 369);
+		if (s_menu.focus == FocusArea::Search)
+			DrawElevatedSurface(draw, layout, searchMin, searchMax, true);
 		DrawSearchIcon(draw, layout, Point(layout, 355, 348));
 		ImGui::SetCursorScreenPos(Point(layout, 375, 334));
 		ImGui::SetNextItemWidth(DrawerWidth(layout, 260.0f));
@@ -2449,57 +2740,144 @@ namespace
 	void DrawForgePage(ImDrawList* draw, const RiftLayout& layout)
 	{
 		DrawHeader(draw, layout);
+		const auto theme = CurrentTheme();
 		const ImVec2 panelMin = Point(layout, 316, 142);
 		const ImVec2 panelMax = Point(layout, 1262, 630);
 		DrawGlassPanel(draw, layout, panelMin, panelMax, 8.0f, true);
-		DrawText(draw, Point(layout, 338, 164), WithAlpha(CurrentTheme().accent, layout.alpha),
-			12.0f * layout.scale, "SKYLANDER FORGE");
-		DrawText(draw, Point(layout, 337, 188), WithAlpha(CurrentTheme().text, layout.alpha),
-			24.0f * layout.scale, "CREATE A .SKY FILE");
-		const auto& definitions = s_menu.catalog.GetCreatableDefinitions();
+		DrawShadowedText(draw, Point(layout, 338, 162), WithAlpha(theme.text, layout.alpha),
+			23.0f * layout.scale, "CREATE A FIGURE", layout.scale);
+		const auto definitions = BuildForgeDefinitions();
+		if (!definitions.empty())
+			s_menu.selectedDefinition = std::clamp(s_menu.selectedDefinition, 0,
+				static_cast<int>(definitions.size()) - 1);
+		else
+			s_menu.selectedDefinition = 0;
+		if (!definitions.empty())
+		{
+			const auto& selected = *definitions[s_menu.selectedDefinition];
+			DrawTextFit(draw, Point(layout, 548, 166), WithAlpha(theme.text, layout.alpha),
+				17.0f * layout.scale, DrawerWidth(layout, 454.0f), selected.name);
+			DrawTextRightAligned(draw, Point(layout, 1238, 170),
+				WithAlpha(ElementColor(selected.element, theme.accent), layout.alpha),
+				10.5f * layout.scale, fmt::format("{}  /  {}", ElementName(selected.element),
+					FigureTypeName(selected.type)));
+		}
+
+		const ImVec2 searchMin = Point(layout, 338, 211);
+		const ImVec2 searchMax = Point(layout, 685, 253);
+		const ImVec2 sortMin = Point(layout, 697, 211);
+		const ImVec2 sortMax = Point(layout, 866, 253);
+		const ImVec2 typeMin = Point(layout, 878, 211);
+		const ImVec2 typeMax = Point(layout, 1056, 253);
+		const ImVec2 elementMin = Point(layout, 1068, 211);
+		const ImVec2 elementMax = Point(layout, 1238, 253);
+		const bool searchFocused = s_menu.forgeToolbarFocused && s_menu.forgeToolbarSelection == 0;
+		const bool sortFocused = s_menu.forgeToolbarFocused && s_menu.forgeToolbarSelection == 1;
+		const bool typeFocused = s_menu.forgeToolbarFocused && s_menu.forgeToolbarSelection == 2;
+		const bool elementFocused = s_menu.forgeToolbarFocused && s_menu.forgeToolbarSelection == 3;
+		DrawElevatedSurface(draw, layout, searchMin, searchMax, searchFocused || s_menu.forgeSearchText[0] != '\0');
+		DrawElevatedSurface(draw, layout, sortMin, sortMax, sortFocused || s_menu.forgeSortMode != 0);
+		DrawElevatedSurface(draw, layout, typeMin, typeMax, typeFocused || s_menu.forgeTypeFilter != 0);
+		DrawElevatedSurface(draw, layout, elementMin, elementMax, elementFocused || s_menu.forgeElementFilter != 0,
+			s_menu.forgeElementFilter == 0 ? theme.accent :
+				ElementColor(ElementForChoice(s_menu.forgeElementFilter), theme.accent));
+		DrawSearchIcon(draw, layout, Point(layout, 359, 231));
+		ImGui::SetCursorScreenPos(Point(layout, 378, 215));
+		ImGui::SetNextItemWidth(DrawerWidth(layout, 294.0f));
+		ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, {0, 7.0f * layout.scale});
+		ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(0, 0, 0, 0));
+		ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(0, 0, 0, 0));
+		ImGui::PushStyleColor(ImGuiCol_Text, WithAlpha(theme.text, layout.alpha));
+		ImGui::PushStyleColor(ImGuiCol_TextDisabled, WithAlpha(theme.muted, layout.alpha));
+		ImFont* searchFont = ImGui_GetFont(13.0f * layout.scale);
+		if (searchFont)
+			ImGui::PushFont(searchFont);
+		if (ImGui::InputTextWithHint("##rift_create_search", "Search figures...",
+			s_menu.forgeSearchText.data(), s_menu.forgeSearchText.size()))
+			s_menu.selectedDefinition = 0;
+		if (searchFont)
+			ImGui::PopFont();
+		ImGui::PopStyleColor(4);
+		ImGui::PopStyleVar();
+		if (ClickedRect(layout, searchMin, searchMax))
+			s_menu.focus = FocusArea::Search;
+		if (ClickedRect(layout, searchMin, searchMax))
+		{
+			s_menu.forgeToolbarFocused = true;
+			s_menu.forgeToolbarSelection = 0;
+		}
+		DrawTextFit(draw, Point(layout, 712, 226), WithAlpha(theme.text, layout.alpha),
+			11.0f * layout.scale, DrawerWidth(layout, 142.0f), fmt::format("SORT  {}", ForgeSortName()));
+		DrawTextFit(draw, Point(layout, 892, 226), WithAlpha(theme.text, layout.alpha),
+			11.0f * layout.scale, DrawerWidth(layout, 151.0f), fmt::format("TYPE  {}", ForgeTypeFilterName()));
+		DrawTextFit(draw, Point(layout, 1082, 226), WithAlpha(theme.text, layout.alpha),
+			11.0f * layout.scale, DrawerWidth(layout, 143.0f),
+			fmt::format("ELEMENT  {}", ElementChoiceName(s_menu.forgeElementFilter, "ALL")));
+		if (ClickedRect(layout, sortMin, sortMax))
+		{
+			s_menu.forgeToolbarFocused = true;
+			s_menu.forgeToolbarSelection = 1;
+			CycleForgeSort();
+		}
+		if (ClickedRect(layout, typeMin, typeMax))
+		{
+			s_menu.forgeToolbarFocused = true;
+			s_menu.forgeToolbarSelection = 2;
+			CycleForgeTypeFilter();
+		}
+		if (ClickedRect(layout, elementMin, elementMax))
+		{
+			s_menu.forgeToolbarFocused = true;
+			s_menu.forgeToolbarSelection = 3;
+			CycleForgeElementFilter();
+		}
+
 		if (definitions.empty())
 		{
-			DrawText(draw, Point(layout, 338, 250), WithAlpha(IM_COL32(230, 240, 247, 255), layout.alpha),
-				16.0f * layout.scale, "No figures with valid artwork were found.");
-			DrawText(draw, Point(layout, 338, 284), WithAlpha(CurrentTheme().muted, layout.alpha),
-				13.0f * layout.scale, "Check the assets folder and skylanders_db.json, then refresh the library.");
+			DrawTextCentered(draw, Point(layout, 788, 376), WithAlpha(theme.text, layout.alpha),
+				18.0f * layout.scale, "No figures match these filters");
+			DrawTextCentered(draw, Point(layout, 788, 409), WithAlpha(theme.muted, layout.alpha),
+				12.0f * layout.scale, "Clear the search or press X to reset the create catalog.");
 			return;
 		}
 		s_menu.selectedDefinition = std::clamp(s_menu.selectedDefinition, 0, static_cast<int>(definitions.size()) - 1);
 		const int page = s_menu.selectedDefinition / kLibraryPageSize;
 		const int pageBegin = page * kLibraryPageSize;
 		const int pageEnd = std::min(pageBegin + kLibraryPageSize, static_cast<int>(definitions.size()));
-		DrawText(draw, Point(layout, 1160, 183), WithAlpha(CurrentTheme().muted, layout.alpha),
-			11.0f * layout.scale, fmt::format("{:03} / {:03}", s_menu.selectedDefinition + 1, definitions.size()));
+		DrawTextRightAligned(draw, Point(layout, 1238, 270), WithAlpha(theme.muted, layout.alpha),
+			10.0f * layout.scale, fmt::format("{:03} / {:03}", s_menu.selectedDefinition + 1, definitions.size()));
 		int clicked = -1;
 		for (int index = pageBegin; index < pageEnd; ++index)
 		{
+			const auto& definition = *definitions[index];
 			const int local = index - pageBegin;
 			const int column = local % kLibraryColumns;
 			const int row = local / kLibraryColumns;
 			const bool selected = index == s_menu.selectedDefinition;
-			const std::string focusKey = fmt::format("{}:{}", definitions[index].id, definitions[index].variant);
+			const std::string focusKey = fmt::format("{}:{}", definition.id, definition.variant);
 			float& focus = s_forgeFocusAmounts[focusKey];
 			focus = AnimateFocus(focus, selected ? 1.0f : 0.0f);
 			const float side = column < 2 ? 1.0f : -1.0f;
-			const ImVec2 center = Point(layout, 430.0f + column * 220.0f + side * focus * 10.0f,
-				326.0f + row * 186.0f - focus * 13.0f);
-			auto texture = GetArtworkTexture(definitions[index].imagePath);
-			texture.accent = ElementColor(definitions[index].element, texture.accent);
+			const ImVec2 center = Point(layout, 430.0f + column * 220.0f + side * focus * 8.0f,
+				354.0f + row * 170.0f - focus * 10.0f);
+			auto texture = GetArtworkTexture(definition.imagePath);
+			texture.accent = ElementColor(definition.element, texture.accent);
 			if (focus > 0.01f)
-				DrawGlow(draw, center, 108.0f * layout.scale, texture.accent, layout.alpha * focus * 0.58f);
-			DrawCard(draw, texture, center, (150.0f + focus * 18.0f) * layout.scale,
+				DrawGlow(draw, center, 102.0f * layout.scale, texture.accent, layout.alpha * focus * 0.50f);
+			DrawCard(draw, texture, center, (138.0f + focus * 16.0f) * layout.scale,
 				side * (1.0f - focus) * 0.012f, focus, layout.alpha * (0.80f + focus * 0.20f));
-			DrawTextFit(draw, Point(layout, 358.0f + column * 220.0f, 414.0f + row * 186.0f),
-				WithAlpha(IM_COL32(230, 240, 247, 255), layout.alpha), 12.0f * layout.scale,
-				DrawerWidth(layout, 150.0f), Uppercase(ShortName(definitions[index].name, 22)));
-			const ImVec2 minimum = Point(layout, 370.0f + column * 220.0f, 238.0f + row * 186.0f);
-			const ImVec2 maximum = Point(layout, 490.0f + column * 220.0f, 440.0f + row * 186.0f);
+			const ImVec2 minimum = Point(layout, 356.0f + column * 220.0f, 278.0f + row * 170.0f);
+			const ImVec2 maximum = Point(layout, 504.0f + column * 220.0f, 430.0f + row * 170.0f);
 			if (layout.alpha > 0.9f && ImGui::IsMouseHoveringRect(minimum, maximum) &&
 				index != s_menu.selectedDefinition)
 				s_menu.selectedDefinition = index;
+			if (ImGui::IsMouseHoveringRect(minimum, maximum))
+				ImGui::SetTooltip("%s", definition.name.c_str());
 			if (ClickedRect(layout, minimum, maximum))
+			{
+				s_menu.forgeToolbarFocused = false;
 				clicked = index;
+			}
 		}
 		if (clicked >= 0)
 		{
@@ -2582,14 +2960,10 @@ namespace
 		}
 		case 14:
 		{
-			static constexpr std::array names{"CLEAN", "FINE", "DITHER", "GRAIN"};
-			return names[std::clamp<sint32>(config.skylander_card_texture.GetValue(), 0, 3)];
-		}
-		case 15:
-		{
 			static constexpr std::array names{"ARC", "FAN", "FLAT", "DEPTH"};
 			return names[std::clamp<sint32>(config.skylander_cascade_style.GetValue(), 0, 3)];
 		}
+		case 15: return "CHECK NOW";
 		default: return {};
 		}
 	}
@@ -2693,8 +3067,10 @@ namespace
 			break;
 		case 12: config.skylander_corner_style = WrapChoice(config.skylander_corner_style.GetValue() + direction, 3); break;
 		case 13: config.skylander_card_border = WrapChoice(config.skylander_card_border.GetValue() + direction, 4); break;
-		case 14: config.skylander_card_texture = WrapChoice(config.skylander_card_texture.GetValue() + direction, 4); break;
-		case 15: config.skylander_cascade_style = WrapChoice(config.skylander_cascade_style.GetValue() + direction, 4); break;
+		case 14: config.skylander_cascade_style = WrapChoice(config.skylander_cascade_style.GetValue() + direction, 4); break;
+		case 15:
+			RequestUpdateCheck();
+			return;
 		default: return;
 		}
 		if (OptionValue(option) == previousValue)
@@ -2711,11 +3087,11 @@ namespace
 		const ImVec2 panelMax = Point(layout, 1262, 630);
 		DrawGlassPanel(draw, layout, panelMin, panelMax, 8.0f, true);
 		DrawText(draw, Point(layout, 338, 164), WithAlpha(CurrentTheme().accent, layout.alpha),
-			12.0f * layout.scale, "RIFT PRESENTATION");
+			12.0f * layout.scale, "RIFT SETTINGS");
 		DrawText(draw, Point(layout, 337, 188), WithAlpha(CurrentTheme().text, layout.alpha),
-			24.0f * layout.scale, "LOOK, MOTION & FEEDBACK");
+			24.0f * layout.scale, "DISPLAY, FEEDBACK & UPDATES");
 		DrawText(draw, Point(layout, 337, 222), WithAlpha(CurrentTheme().muted, layout.alpha),
-			12.0f * layout.scale, "EVERY OPTION APPLIES IMMEDIATELY AND IS SAVED.");
+			12.0f * layout.scale, "USE THE D-PAD TO CHOOSE. PRESS A TO CHANGE THE SELECTED OPTION.");
 
 		const std::array<std::pair<std::string_view, std::string_view>, kOptionCount> rows{{
 			{"MOTION", "Opening, card lift and magical movement"},
@@ -2732,8 +3108,8 @@ namespace
 			{"HAPTIC STRENGTH", "Off through strong feedback"},
 			{"CORNERS", "Square, subtle, or round panels"},
 			{"CARD BORDER", "Element edge, etched frame, or runes"},
-			{"CARD TEXTURE", "Printed dithering and material grain"},
-			{"CASCADE SHAPE", "Arc, fan, flat, or deep stack"}}};
+			{"CASCADE SHAPE", "Arc, fan, flat, or deep stack"},
+			{"CHECK FOR UPDATES", "Compare this build with the latest GitHub release"}}};
 		for (int option = 0; option < static_cast<int>(rows.size()); ++option)
 		{
 			const int column = option / 8;
@@ -2928,7 +3304,31 @@ namespace
 			WithAlpha(IM_COL32(157, 207, 234, 255), layout.alpha * 0.24f), 1.0f * layout.scale);
 		if (s_menu.page == RiftPage::Dashboard)
 		{
-			if (s_menu.focus == FocusArea::ElementFilter)
+			if (s_menu.focus == FocusArea::Search)
+			{
+				DrawActionHint(draw, layout, 318, "A", "SEARCH");
+				DrawActionHint(draw, layout, 438, "X", "CLEAR");
+				DrawActionHint(draw, layout, 548, "LB", "ORDER");
+				DrawActionHint(draw, layout, 665, "B", "CLOSE");
+				DrawText(draw, Point(layout, 975, 668), WithAlpha(IM_COL32(140, 171, 193, 255), layout.alpha),
+					11.0f * layout.scale, "A  OPEN CONTROLLER KEYBOARD");
+				if (FooterClicked(layout, 310, 425))
+					OpenSearchKeyboard(SearchTarget::Collection);
+				else if (FooterClicked(layout, 427, 535))
+				{
+					s_menu.searchText.fill(0);
+					RebuildLibrary();
+					PulseHaptics();
+				}
+				else if (FooterClicked(layout, 537, 650))
+					OpenLibraryOrder();
+				else if (FooterClicked(layout, 652, 780))
+				{
+					SetMenuOpen(false, false);
+					PulseHaptics(UiSound::Back);
+				}
+			}
+			else if (s_menu.focus == FocusArea::ElementFilter)
 			{
 				DrawActionHint(draw, layout, 318, "A", "APPLY FILTER");
 				DrawActionHint(draw, layout, 474, "LB", "ORDER");
@@ -3025,25 +3425,43 @@ namespace
 		}
 		else if (s_menu.page == RiftPage::Forge)
 		{
-			DrawActionHint(draw, layout, 318, "A", "CREATE .SKY");
+			DrawActionHint(draw, layout, 318, "A", s_menu.forgeToolbarFocused ? "SELECT" : "CREATE .SKY");
 			DrawActionHint(draw, layout, 470, "B", "BACK");
-			DrawText(draw, Point(layout, 1030, 668), WithAlpha(IM_COL32(140, 171, 193, 255), layout.alpha),
-				11.0f * layout.scale, "D-PAD  BROWSE CATALOG");
+			DrawActionHint(draw, layout, 592, "X", "RESET FILTERS");
+			DrawText(draw, Point(layout, 876, 668), WithAlpha(IM_COL32(140, 171, 193, 255), layout.alpha),
+				10.0f * layout.scale, s_menu.forgeToolbarFocused ?
+					"D-PAD  CHOOSE TOOL     A  SELECT" : "D-PAD  BROWSE     UP  SEARCH & FILTERS");
 			if (FooterClicked(layout, 310, 455))
-				ForgeSelectedFigure();
+			{
+				if (!s_menu.forgeToolbarFocused)
+					ForgeSelectedFigure();
+				else if (s_menu.forgeToolbarSelection == 0)
+					OpenSearchKeyboard(SearchTarget::Create);
+				else if (s_menu.forgeToolbarSelection == 1)
+					CycleForgeSort();
+				else if (s_menu.forgeToolbarSelection == 2)
+					CycleForgeTypeFilter();
+				else
+					CycleForgeElementFilter();
+			}
 			else if (FooterClicked(layout, 458, 585))
 			{
 				s_menu.page = RiftPage::Dashboard;
 				s_menu.focus = FocusArea::Library;
 				PulseHaptics(UiSound::Back);
 			}
+			else if (FooterClicked(layout, 588, 760))
+				ResetForgeFilters();
 		}
 		else
 		{
-			DrawActionHint(draw, layout, 318, "A", "CHANGE");
+			DrawActionHint(draw, layout, 318, "A", s_menu.page == RiftPage::Options &&
+				s_menu.selectedOption == kOptionCount - 1 ? "CHECK" : "CHANGE");
 			DrawActionHint(draw, layout, 445, "B", "BACK");
 			DrawText(draw, Point(layout, 965, 668), WithAlpha(IM_COL32(140, 171, 193, 255), layout.alpha),
-				11.0f * layout.scale, "D-PAD  SELECT / ADJUST");
+				11.0f * layout.scale, s_menu.page == RiftPage::Options &&
+					s_menu.selectedOption == kOptionCount - 1 ?
+					"D-PAD  SELECT     A  CHECK" : "D-PAD  SELECT     A  CHANGE");
 			if (FooterClicked(layout, 310, 430))
 			{
 				if (s_menu.page == RiftPage::Options)
@@ -3128,6 +3546,70 @@ namespace
 			14.0f * layout.scale, width - DrawerWidth(layout, 44.0f), s_menu.toast);
 	}
 
+	void DrawOnScreenKeyboard(ImDrawList* draw, const RiftLayout& layout)
+	{
+		if (s_menu.searchTarget == SearchTarget::None)
+			return;
+		const auto theme = CurrentTheme();
+		draw->AddRectFilled(Point(layout, kDrawerX, 0), Point(layout, 1280, 720),
+			WithAlpha(IM_COL32(0, 2, 9, 255), layout.alpha * 0.68f));
+		const ImVec2 panelMin = Point(layout, 376, 142);
+		const ImVec2 panelMax = Point(layout, 1248, 620);
+		DrawGlassPanel(draw, layout, panelMin, panelMax, 9.0f, true);
+		const std::string_view title = s_menu.searchTarget == SearchTarget::Create ?
+			"SEARCH FIGURES" : "SEARCH COLLECTION";
+		DrawShadowedText(draw, Point(layout, 412, 169), WithAlpha(theme.text, layout.alpha),
+			24.0f * layout.scale, title, layout.scale);
+		DrawTextRightAligned(draw, Point(layout, 1216, 176), WithAlpha(theme.muted, layout.alpha),
+			10.0f * layout.scale, "CONTROLLER KEYBOARD");
+
+		const ImVec2 fieldMin = Point(layout, 412, 210);
+		const ImVec2 fieldMax = Point(layout, 1216, 258);
+		DrawElevatedSurface(draw, layout, fieldMin, fieldMax, true);
+		const auto& searchText = ActiveSearchText();
+		const std::string_view value = searchText[0] ? std::string_view(searchText.data()) : std::string_view("Search is empty");
+		DrawTextFit(draw, Point(layout, 433, 224),
+			WithAlpha(searchText[0] ? theme.text : theme.muted, layout.alpha),
+			15.0f * layout.scale, DrawerWidth(layout, 760.0f), value);
+
+		for (int row = 0; row < 5; ++row)
+		{
+			const int count = KeyboardColumnCount(row);
+			const float gap = 8.0f;
+			const float rowWidth = 780.0f;
+			const float keyWidth = (rowWidth - gap * (count - 1)) / count;
+			const float startX = 814.0f - rowWidth * 0.5f;
+			const float y = 282.0f + row * 56.0f;
+			for (int column = 0; column < count; ++column)
+			{
+				const ImVec2 minimum = Point(layout, startX + column * (keyWidth + gap), y);
+				const ImVec2 maximum = Point(layout, startX + column * (keyWidth + gap) + keyWidth, y + 42.0f);
+				const bool selected = row == s_menu.keyboardRow && column == s_menu.keyboardColumn;
+				DrawElevatedSurface(draw, layout, minimum, maximum, selected);
+				std::string label;
+				if (row < 4)
+					label.assign(1, KeyboardCharacterRows()[row][column]);
+				else
+				{
+					static constexpr std::array<std::string_view, 4> actions{
+						"SPACE", "BACKSPACE", "CLEAR", "DONE"};
+					label = actions[column];
+				}
+				DrawTextCentered(draw, {(minimum.x + maximum.x) * 0.5f, (minimum.y + maximum.y) * 0.5f},
+					WithAlpha(selected ? theme.accent : theme.text, layout.alpha),
+					(row == 4 ? 11.0f : 14.0f) * layout.scale, label);
+				if (ClickedRect(layout, minimum, maximum))
+				{
+					s_menu.keyboardRow = row;
+					s_menu.keyboardColumn = column;
+					ActivateKeyboardKey();
+				}
+			}
+		}
+		DrawTextCentered(draw, Point(layout, 814, 589), WithAlpha(theme.muted, layout.alpha),
+			10.5f * layout.scale, "A  SELECT    X  BACKSPACE    Y  SPACE    B  CLOSE");
+	}
+
 	void MoveLibrarySelection(int delta)
 	{
 		if (s_menu.library.empty())
@@ -3186,6 +3668,20 @@ namespace
 			}
 			if (down)
 			{
+				s_menu.focus = FocusArea::Search;
+				PulseHaptics();
+			}
+			return;
+		}
+		if (s_menu.focus == FocusArea::Search)
+		{
+			if (up)
+			{
+				s_menu.focus = FocusArea::Portal;
+				PulseHaptics();
+			}
+			if (down)
+			{
 				s_menu.focus = FocusArea::ElementFilter;
 				s_menu.selectedElementFilter = std::clamp<sint32>(
 					GetConfig().emulated_usb_devices.skylander_element_filter.GetValue(), 0, 11);
@@ -3203,7 +3699,7 @@ namespace
 			}
 			if (up)
 			{
-				s_menu.focus = FocusArea::Portal;
+				s_menu.focus = FocusArea::Search;
 				PulseHaptics();
 			}
 			if (down)
@@ -3350,7 +3846,22 @@ namespace
 			const bool next = NavigationPulse(rightDown, s_menu.rightWasDown, 1);
 			const bool up = NavigationPulse(upDown, s_menu.upWasDown, 2);
 			const bool down = NavigationPulse(downDown, s_menu.downWasDown, 3);
-			if (backDown && !s_menu.backWasDown)
+			if (s_menu.searchTarget != SearchTarget::None)
+			{
+				if (backDown && !s_menu.backWasDown)
+					CloseSearchKeyboard();
+				else
+				{
+					if (previous) MoveKeyboardHorizontal(-1);
+					if (next) MoveKeyboardHorizontal(1);
+					if (up) MoveKeyboardVertical(-1);
+					if (down) MoveKeyboardVertical(1);
+					if (acceptDown && !s_menu.acceptWasDown) ActivateKeyboardKey();
+					if (removeDown && !s_menu.removeWasDown) BackspaceSearchText();
+					if (detailsDown && !s_menu.detailsWasDown) AppendSearchCharacter(' ');
+				}
+			}
+			else if (backDown && !s_menu.backWasDown)
 			{
 				if (s_menu.page == RiftPage::Dashboard)
 					SetMenuOpen(false, false);
@@ -3372,13 +3883,24 @@ namespace
 						ActivateHeaderSelection();
 					else if (s_menu.focus == FocusArea::ElementFilter)
 						ApplySelectedElementFilter();
+					else if (s_menu.focus == FocusArea::Search)
+						OpenSearchKeyboard(SearchTarget::Collection);
 					else if (s_menu.focus == FocusArea::Library && !s_menu.library.empty())
 						BeginPlacement(s_menu.library[s_menu.selectedLibrary]);
 					else if (s_menu.focus == FocusArea::Portal)
 						OpenPortalDetails();
 				}
 				if (removeDown && !s_menu.removeWasDown)
-					RemoveFocusedFigure();
+				{
+					if (s_menu.focus == FocusArea::Search)
+					{
+						s_menu.searchText.fill(0);
+						RebuildLibrary();
+						PulseHaptics();
+					}
+					else
+						RemoveFocusedFigure();
+				}
 				if (detailsDown && !s_menu.detailsWasDown)
 				{
 					if (s_menu.focus == FocusArea::Portal)
@@ -3420,27 +3942,77 @@ namespace
 			}
 			else if (s_menu.page == RiftPage::Forge)
 			{
-				const auto& definitions = s_menu.catalog.GetCreatableDefinitions();
-				if (!definitions.empty() && (previous || next || up || down))
+				const auto definitions = BuildForgeDefinitions();
+				if (s_menu.forgeToolbarFocused)
 				{
-					int delta = next ? 1 : previous ? -1 : down ? kLibraryColumns : -kLibraryColumns;
-					const int old = s_menu.selectedDefinition;
-					s_menu.selectedDefinition = std::clamp(s_menu.selectedDefinition + delta, 0,
-						static_cast<int>(definitions.size()) - 1);
-					if (old != s_menu.selectedDefinition) PulseHaptics();
+					if (previous || next)
+					{
+						s_menu.forgeToolbarSelection = WrapChoice(
+							s_menu.forgeToolbarSelection + (next ? 1 : -1), 4);
+						PulseHaptics();
+					}
+					if (down)
+					{
+						s_menu.forgeToolbarFocused = false;
+						PulseHaptics();
+					}
+					if (acceptDown && !s_menu.acceptWasDown)
+					{
+						switch (s_menu.forgeToolbarSelection)
+						{
+						case 0: OpenSearchKeyboard(SearchTarget::Create); break;
+						case 1: CycleForgeSort(); break;
+						case 2: CycleForgeTypeFilter(); break;
+						default: CycleForgeElementFilter(); break;
+						}
+					}
 				}
-				if (acceptDown && !s_menu.acceptWasDown)
-					ForgeSelectedFigure();
+				else
+				{
+					if (up && (definitions.empty() ||
+						(s_menu.selectedDefinition % kLibraryPageSize) < kLibraryColumns))
+					{
+						s_menu.forgeToolbarFocused = true;
+						PulseHaptics();
+					}
+					else if (!definitions.empty() && (previous || next || up || down))
+					{
+						const int delta = next ? 1 : previous ? -1 : down ? kLibraryColumns : -kLibraryColumns;
+						const int old = s_menu.selectedDefinition;
+						s_menu.selectedDefinition = std::clamp(s_menu.selectedDefinition + delta, 0,
+							static_cast<int>(definitions.size()) - 1);
+						if (old != s_menu.selectedDefinition) PulseHaptics();
+					}
+					if (acceptDown && !s_menu.acceptWasDown)
+						ForgeSelectedFigure();
+				}
+				if (removeDown && !s_menu.removeWasDown)
+					ResetForgeFilters();
+				if (sortDown && !s_menu.sortWasDown)
+					CycleForgeSort();
+				if (favoriteDown && !s_menu.favoriteWasDown)
+					CycleForgeTypeFilter();
+				if (detailsDown && !s_menu.detailsWasDown)
+					CycleForgeElementFilter();
 			}
 			else if (s_menu.page == RiftPage::Options)
 			{
 				if (up || down)
 				{
-					s_menu.selectedOption = (s_menu.selectedOption + (down ? 1 : kOptionCount - 1)) % kOptionCount;
+					const int column = s_menu.selectedOption / 8;
+					const int count = column == 0 ? 8 : kOptionCount - 8;
+					const int row = WrapChoice(s_menu.selectedOption % 8 + (down ? 1 : -1), count);
+					s_menu.selectedOption = column * 8 + row;
 					PulseHaptics();
 				}
 				if (previous || next)
-					AdjustOption(s_menu.selectedOption, next ? 1 : -1);
+				{
+					const int old = s_menu.selectedOption;
+					const int row = s_menu.selectedOption % 8;
+					const int column = next ? 1 : 0;
+					s_menu.selectedOption = column * 8 + std::min(row, column == 0 ? 7 : kOptionCount - 9);
+					if (old != s_menu.selectedOption) PulseHaptics();
+				}
 				if (acceptDown && !s_menu.acceptWasDown)
 					AdjustOption(s_menu.selectedOption, 1);
 			}
@@ -3451,8 +4023,6 @@ namespace
 					s_menu.selectedLibraryOption = (s_menu.selectedLibraryOption + (down ? 1 : 4)) % 5;
 					PulseHaptics();
 				}
-				if (previous || next)
-					AdjustLibraryOption(s_menu.selectedLibraryOption, next ? 1 : -1);
 				if (acceptDown && !s_menu.acceptWasDown)
 					AdjustLibraryOption(s_menu.selectedLibraryOption, 1);
 			}
@@ -3587,6 +4157,7 @@ namespace
 			DrawPlacementImpact(ImGui::GetForegroundDrawList(), layout);
 			DrawToast(ImGui::GetForegroundDrawList(), layout);
 			DrawFooter(ImGui::GetForegroundDrawList(), pageLayout);
+			DrawOnScreenKeyboard(ImGui::GetForegroundDrawList(), pageLayout);
 		}
 		ImGui::End();
 		ImGui::PopStyleVar();
@@ -3609,4 +4180,9 @@ void SkylanderQuickMenu_Reset()
 {
 	s_resetRequested.store(true, std::memory_order_release);
 	EmulatedController::SetRiftInputCaptured(false);
+}
+
+bool SkylanderQuickMenu_ConsumeUpdateCheckRequest()
+{
+	return s_updateCheckRequested.exchange(false, std::memory_order_acq_rel);
 }

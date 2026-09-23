@@ -191,18 +191,37 @@ namespace
 
 	static_assert(ParseRiftIteration("rift-iteration-006")->revision == 0);
 	static_assert(ParseRiftIteration("rift-iteration-006.12")->revision == 12);
+	static_assert(IsNewerIteration(*ParseRiftIteration("rift-iteration-006.1"), *ParseRiftIteration("rift-iteration-006")));
+	static_assert(IsNewerIteration(*ParseRiftIteration("rift-iteration-006.2"), *ParseRiftIteration("rift-iteration-006.1")));
 	static_assert(IsNewerIteration(*ParseRiftIteration("rift-iteration-007"), *ParseRiftIteration("rift-iteration-006.99")));
 	static_assert(!ParseRiftIteration("006.2"));
 	static_assert(ParseRiftIteration(RiftVersion::ReleaseTag).has_value());
+
+	void ConfigureSecureCurl(CURL* curl, char* errorBuffer)
+	{
+		curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, errorBuffer);
+		curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_1);
+		curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+		curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+#if BOOST_OS_WINDOWS
+		curl_easy_setopt(curl, CURLOPT_SSL_OPTIONS, static_cast<long>(CURLSSLOPT_NATIVE_CA));
+#endif
+		const auto& proxy = GetConfig().proxy_server.GetValue();
+		if (!proxy.empty())
+			curl_easy_setopt(curl, CURLOPT_PROXY, proxy.c_str());
+	}
 }
 
-bool CemuUpdateWindow::QueryUpdateInfo(std::string& downloadUrlOut, std::string& changelogUrlOut, std::string& latestTagOut)
+CemuUpdateWindow::UpdateQueryResult CemuUpdateWindow::QueryUpdateInfo(std::string& downloadUrlOut,
+	std::string& changelogUrlOut, std::string& latestTagOut)
 {
 	std::string buffer;
 	constexpr std::string_view url = "https://api.github.com/repos/Swanikins/Rift-Barebones-Releases/releases?per_page=20";
 	auto* curl = curl_easy_init();
 	if (!curl)
-		return false;
+		return UpdateQueryResult::Error;
+	char errorBuffer[CURL_ERROR_SIZE]{};
+	ConfigureSecureCurl(curl, errorBuffer);
 
 	auto* headers = curl_slist_append(nullptr, "Accept: application/vnd.github+json");
 	headers = curl_slist_append(headers, "X-GitHub-Api-Version: 2022-11-28");
@@ -215,10 +234,8 @@ bool CemuUpdateWindow::QueryUpdateInfo(std::string& downloadUrlOut, std::string&
 	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
 	curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 8L);
 	curl_easy_setopt(curl, CURLOPT_TIMEOUT, 20L);
-	curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
-	curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
 
-	bool result = false;
+	UpdateQueryResult result = UpdateQueryResult::Error;
 	const CURLcode cr = curl_easy_perform(curl);
 	if (cr == CURLE_OK)
 	{
@@ -229,25 +246,33 @@ bool CemuUpdateWindow::QueryUpdateInfo(std::string& downloadUrlOut, std::string&
 			rapidjson::Document releases;
 			releases.Parse(buffer.data(), buffer.size());
 			const auto current = ParseRiftIteration(RiftVersion::ReleaseTag);
-			std::optional<RiftRelease> selected;
+			std::optional<RiftRelease> latest;
 			if (!releases.HasParseError() && releases.IsArray() && current)
 			{
+				result = UpdateQueryResult::Current;
 				for (const auto& value : releases.GetArray())
 				{
 					const auto release = ReadRelease(value, GetConfig().receive_untested_updates);
-					if (!release || !IsNewerIteration(release->iteration, *current))
+					if (!release)
 						continue;
-					if (!selected || IsNewerIteration(release->iteration, selected->iteration))
-						selected = release;
+					if (!latest || IsNewerIteration(release->iteration, latest->iteration))
+						latest = release;
 				}
 			}
 
-			if (selected)
+			if (latest && current)
 			{
-				downloadUrlOut = selected->downloadUrl;
-				changelogUrlOut = selected->releaseUrl;
-				latestTagOut = selected->tag;
-				result = true;
+				latestTagOut = latest->tag;
+				if (IsNewerIteration(latest->iteration, *current))
+				{
+					downloadUrlOut = latest->downloadUrl;
+					changelogUrlOut = latest->releaseUrl;
+					result = UpdateQueryResult::Available;
+				}
+				else if (IsNewerIteration(*current, latest->iteration))
+				{
+					result = UpdateQueryResult::Ahead;
+				}
 			}
 		}
 		else
@@ -257,7 +282,8 @@ bool CemuUpdateWindow::QueryUpdateInfo(std::string& downloadUrlOut, std::string&
 	}
 	else
 	{
-		cemuLog_log(LogType::Force, "Rift update check failed with CURL error {}", static_cast<int>(cr));
+		cemuLog_log(LogType::Force, "Rift update check failed with CURL error {} ({}): {}",
+			static_cast<int>(cr), curl_easy_strerror(cr), errorBuffer);
 	}
 
 	curl_slist_free_all(headers);
@@ -273,7 +299,7 @@ std::future<bool> CemuUpdateWindow::IsUpdateAvailableAsync()
 bool CemuUpdateWindow::CheckVersion()
 {
 	std::string downloadUrl, changelogUrl, latestTag;
-	return QueryUpdateInfo(downloadUrl, changelogUrl, latestTag);
+	return QueryUpdateInfo(downloadUrl, changelogUrl, latestTag) == UpdateQueryResult::Available;
 }
 
 
@@ -298,6 +324,8 @@ bool CemuUpdateWindow::DownloadCemuZip(const std::string& url, const fs::path& f
 	auto* curl = curl_easy_init();
 	if (!curl)
 		return false;
+	char errorBuffer[CURL_ERROR_SIZE]{};
+	ConfigureSecureCurl(curl, errorBuffer);
 
 	auto writeData = +[](void* ptr, size_t size, size_t nmemb, void* context) -> size_t
 	{
@@ -309,8 +337,6 @@ bool CemuUpdateWindow::DownloadCemuZip(const std::string& url, const fs::path& f
 
 	curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
 	curl_easy_setopt(curl, CURLOPT_USERAGENT, RiftVersion::UserAgent);
-	curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
-	curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
 	curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1);
 	curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
 	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeData);
@@ -327,7 +353,8 @@ bool CemuUpdateWindow::DownloadCemuZip(const std::string& url, const fs::path& f
 	fsUpdateFile.reset();
 	const bool result = curlResult == CURLE_OK && httpCode >= 200 && httpCode < 300;
 	if (!result)
-		cemuLog_log(LogType::Force, "Rift update download failed with CURL error {} and HTTP status {}", static_cast<int>(curlResult), httpCode);
+		cemuLog_log(LogType::Force, "Rift update download failed with CURL error {} ({}) and HTTP status {}: {}",
+			static_cast<int>(curlResult), curl_easy_strerror(curlResult), httpCode, errorBuffer);
 
 	if (!result && fs::exists(filename))
 	{
@@ -498,10 +525,15 @@ void CemuUpdateWindow::WorkerThread()
 			if (m_order == WorkerOrder::CheckVersion)
 			{
 				auto* event = new wxCommandEvent(wxEVT_RESULT);
-				if (QueryUpdateInfo(m_downloadUrl, m_changelogUrl, m_latestTag))
+				const auto queryResult = QueryUpdateInfo(m_downloadUrl, m_changelogUrl, m_latestTag);
+				if (queryResult == UpdateQueryResult::Available)
 					event->SetInt((int)Result::UpdateAvailable);
-				else
+				else if (queryResult == UpdateQueryResult::Ahead)
+					event->SetInt((int)Result::Ahead);
+				else if (queryResult == UpdateQueryResult::Current)
 					event->SetInt((int)Result::NoUpdateAvailable);
+				else
+					event->SetInt((int)Result::CheckError);
 
 				wxQueueEvent(this, event);
 			}
@@ -776,6 +808,17 @@ void CemuUpdateWindow::OnResult(wxCommandEvent& event)
 		m_text->SetLabel(_("Update installed. Restart Rift to finish."));
 		m_cancelButton->SetLabel(_("Restart"));
 		m_restartRequired = true;
+		break;
+	case Result::Ahead:
+		m_updateButton->Hide();
+		m_cancelButton->SetLabel(_("Exit"));
+		m_text->SetLabel(_("WOAH, WHAT ARE YOU DOING? This Rift build is newer than GitHub."));
+		m_gauge->SetValue(100);
+		break;
+	case Result::CheckError:
+		m_updateButton->Hide();
+		m_cancelButton->SetLabel(_("Exit"));
+		m_text->SetLabel(_("Couldn't check GitHub. Check your connection and try again."));
 		break;
 	case Result::Error:
 		m_updateButton->Enable();

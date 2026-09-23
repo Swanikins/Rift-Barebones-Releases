@@ -29,8 +29,16 @@ private:
 	void OnResult(wxCommandEvent& event);
 	void OnGaugeUpdate(wxCommandEvent& event);
 
+	enum class UpdateQueryResult
+	{
+		Error,
+		Current,
+		Ahead,
+		Available
+	};
+
 	static size_t WriteStringCallback(char* ptr, size_t size, size_t nmemb, void* userdata);
-	static bool QueryUpdateInfo(std::string& downloadUrlOut, std::string& changelogUrlOut, std::string& latestTagOut);
+	static UpdateQueryResult QueryUpdateInfo(std::string& downloadUrlOut, std::string& changelogUrlOut, std::string& latestTagOut);
 	static bool CheckVersion();
 
 	static int ProgressCallback(void* clientp, curl_off_t dltotal, curl_off_t dlnow, curl_off_t ultotal, curl_off_t ulnow);
@@ -53,6 +61,8 @@ private:
 		ExtractSuccess,
 		ExtractError,
 		Success,
+		Ahead,
+		CheckError,
 		Error
 	};
 	std::mutex m_mutex;

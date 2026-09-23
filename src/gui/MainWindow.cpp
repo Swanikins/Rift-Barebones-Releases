@@ -1811,6 +1811,12 @@ bool MainWindow::IsMenuHidden() const
 
 void MainWindow::OnTimer(wxTimerEvent& event)
 {
+	if (SkylanderQuickMenu_ConsumeUpdateCheckRequest())
+	{
+		CemuUpdateWindow updateWindow(this);
+		updateWindow.ShowModal();
+	}
+
 	if(m_update_available.valid() && future_is_ready(m_update_available))
 	{
 		if(m_update_available.get())

@@ -12,7 +12,7 @@ Iteration 006 is the first and current main version of Rift Barebones. (after hu
 
 Rift adds an in-game collection drawer with controller navigation,  haptics, local `.sky` browsing, sorting, filtering, favorites, creation, placement, removal, backups, and recoverable deletion (Doesn't seem that important, but just trust me it is).
 Deleting a selected local figure moves its file into the collection's `.rift-trash` folder. Rift refuses to delete files outside the configured collection and never loads `.rift-trash` or `Backups` as part of the playable catalog 
--Swap Force and Trap Team graphic-pack updates are bundled and credited.-
+Swap Force and Trap Team graphic packs are downloaded through Cemu's community graphic-pack updater.
 Controller setup is saved automatically. Named profiles are optional copies, while the active Player configuration survives restarts and ordinary controller reconnects. Rift can also recover when Windows gives the same SDL controller a different identity after switching between USB and Bluetooth or after a driver change.
 
 ## Screenshots and GIF
@@ -26,7 +26,7 @@ Controller setup is saved automatically. Named profiles are optional copies, whi
 3. Run `Rift-Barebones.exe`.
 4. Open **Options > General settings**. Add the folder containing your legally dumped Wii U games, then choose the included `skylanders` folder or your existing `.sky` collection folder.
 5. Open **Options > Input settings**, choose the Wii U controller type and physical input device for Player 1, and map the required buttons. The active setup saves automatically.
-6. Open **Options > Graphic packs**, click **Download latest community graphic packs**, select your Skylanders game, and enable the graphic packs you want to use. (Big thank you to FrankyBuster for updating and improving the skylander game's graphic packs)
+6. Open **Options > Graphic packs**, click **Download latest community graphic packs**, select your Skylanders game, and enable the graphic packs you want to use. (Best if playing SF or TT. Big thank you to FrankyBuster for updating and improving these two game's graphic packs)
 7. Start your Skylanders game.
 8. Open **Settings** inside Rift and select either Virtual Portal or Physical Portal. You can also adjust a handful of things here.
 9. Press **F7** to open the in-game Rift of Power. With a controller, press **R + D-pad Down** to open or close it. Press **F8** to open the original desktop manager, which i'm like 75% sure is broken and not needed. But I just want to get Rift published already.
@@ -74,7 +74,7 @@ Tips do not purchase builds, features, priority, or support.
 Rift uses Cemu's existing CMake and vcpkg build system. This section assumes you already know how to configure and build a CMake project with Visual Studio 2022.
 
 ```powershell
-git clone --recursive https://github.com/Swanikins/Rift-Barebones-Releases.git
+git clone --recursive https://github.com/Swanikins/Rift-Barebones.git
 cd Rift-Barebones
 ```
 

@@ -231,7 +231,25 @@ namespace skylander_ui
 		const auto it = std::find_if(m_definitions.begin(), m_definitions.end(), [id, variant](const auto& entry) {
 			return entry.id == id && entry.variant == variant;
 		});
-		return it == m_definitions.end() ? nullptr : &*it;
+		if (it != m_definitions.end())
+			return &*it;
+
+		const FigureDefinition* onlyMatch = nullptr;
+		const FigureDefinition* baseMatch = nullptr;
+		int matches = 0;
+		for (const auto& definition : m_definitions)
+		{
+			if (definition.id != id)
+				continue;
+			++matches;
+			onlyMatch = &definition;
+			if (variant == 0 && definition.variant != 0 && (definition.variant & 0x0FFF) == 0 &&
+				(!baseMatch || definition.variant < baseMatch->variant))
+				baseMatch = &definition;
+		}
+		if (baseMatch)
+			return baseMatch;
+		return matches == 1 ? onlyMatch : nullptr;
 	}
 
 	void SkylanderCatalog::ScanCollection()
@@ -259,11 +277,17 @@ namespace skylander_ui
 			if (extension != ".sky" && extension != ".bin" && extension != ".dump" && extension != ".dmp") continue;
 			auto data = FileStream::LoadIntoMemory(it->path());
 			if (!data || data->size() != nsyshid::SKY_FIGURE_SIZE) continue;
+			const uint8 bcc = (*data)[0] ^ (*data)[1] ^ (*data)[2] ^ (*data)[3];
+			if ((*data)[4] != bcc || (*data)[5] != 0x81 || (*data)[6] != 0x01 || (*data)[7] != 0x0F)
+				continue;
 			const uint16 id = (*data)[0x10] | (uint16((*data)[0x11]) << 8);
 			const uint16 variant = (*data)[0x1C] | (uint16((*data)[0x1D]) << 8);
 			const auto* definition = Find(id, variant);
+			std::string displayName = definition ? definition->name : _pathToUtf8(it->path().stem());
+			if (displayName.empty())
+				displayName = "Unknown figure";
 			m_collection.push_back({it->path(), id, variant,
-				definition ? definition->name : fmt::format("Unknown ({}, {})", id, variant),
+				displayName,
 				definition ? ExistingArtworkPath(definition->imagePath) : fs::path{},
 				definition ? definition->element : FigureElement::Unknown,
 				definition ? definition->type : FigureType::Unknown});
