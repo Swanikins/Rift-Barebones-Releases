@@ -25,7 +25,7 @@ Besides that you kinda have to know the struggle of using the native Cemu virtua
 3. Run `Rift-Barebones.exe`.
 4. Open **Options > General settings**. Add the folder containing your legally dumped Wii U games, then choose the included `skylanders` folder or your existing `.sky` collection folder.
 5. Open **Options > Input settings**, choose the Wii U controller type and physical input device for Player 1, and map the required buttons. The active setup saves automatically.
-6. Open **Options > Graphic packs**, click **Download latest community graphic packs**, select your Skylanders game, and enable the graphic packs you want to use. (Best if playing SF or TT. Big thank you to FrankyBuster for updating and improving these two game's graphic packs)
+6. Open **Options > Graphic packs**, click **Download latest community graphic packs**, select your Skylanders game, and enable the graphic packs you want to use. (Big thank you to FrankyBuster for updating and improving these two game's graphic packs)
 7. Start your Skylanders game.
 8. Open **Settings** inside Rift and select either Virtual Portal or Physical Portal. You can also adjust a handful of things here.
 9. Press **F7** to open the in-game Rift of Power. With a controller, press **R + D-pad Down** to open or close it. Press **F8** to open the original desktop manager, which i'm like 75% sure is broken and not needed. But I just want to get Rift published already.
