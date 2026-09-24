@@ -12,9 +12,8 @@ Iteration 006 is the first and current main version of Rift Barebones. (after hu
 
 Rift adds an in-game collection drawer with controller navigation,  haptics, local `.sky` browsing, sorting, filtering, favorites, creation, placement, removal, backups, and recoverable deletion (Doesn't seem that important, but just trust me it is).
 Deleting a selected local figure moves its file into the collection's `.rift-trash` folder. Rift refuses to delete files outside the configured collection and never loads `.rift-trash` or `Backups` as part of the playable catalog 
-Swap Force and Trap Team graphic packs are downloaded through Cemu's community graphic-pack updater.
-Controller setup is saved automatically. Named profiles are optional copies, while the active Player configuration survives restarts and ordinary controller reconnects. Rift can also recover when Windows gives the same SDL controller a different identity after switching between USB and Bluetooth or after a driver change.
-
+Controller setup is saved automatically. Named profiles are optional copies, while the active Player configuration won't just magically disappear and ordinary controller reconnects. Rift can also recover when Windows gives the same SDL controller a different identity after switching between USB and Bluetooth or after a driver change.
+Besides that you kinda have to know the struggle of using the native Cemu virtual portal to know the benefits of Rift. 
 ## Screenshots and GIF
 
 ***I'll add these eventually.***
