@@ -19,7 +19,7 @@ Besides that you kinda have to know the struggle of using the native Cemu virtua
 ***I'll add these eventually.***
 
 ## Quick-start tutorial
-
+(Assuming you have you games/Cemu set up correctly before hand.)
 1. Download the newest Windows ZIP from the [Releases page](https://github.com/Swanikins/Rift-Barebones-Releases/releases).
 2. Extract the entire ZIP into its own folder. Do not run the executable from inside the ZIP.
 3. Run `Rift-Barebones.exe`.
