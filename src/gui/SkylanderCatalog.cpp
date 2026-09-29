@@ -51,6 +51,20 @@ namespace skylander_ui
 		return FigureType::Unknown;
 	}
 
+	static FigureGame GameFromVariant(uint16 variant)
+	{
+		switch ((variant >> 12) & 0x0F)
+		{
+		case 0: return FigureGame::SpyrosAdventure;
+		case 1: return FigureGame::Giants;
+		case 2: return FigureGame::SwapForce;
+		case 3: return FigureGame::TrapTeam;
+		case 4: return FigureGame::SuperChargers;
+		case 5: return FigureGame::Imaginators;
+		default: return FigureGame::Unknown;
+		}
+	}
+
 	static std::optional<uint16> ParseHexId(std::string_view text)
 	{
 		if (text.empty() || text.size() > 8)
@@ -143,7 +157,8 @@ namespace skylander_ui
 			if (!relative.empty() && !relative.has_root_path() &&
 				std::none_of(relative.begin(), relative.end(), [](const auto& part) { return part == ".."; }))
 				artwork = ExistingArtworkPath(m_assetsPath / relative);
-			m_definitions.push_back({id, variant, name.GetString(), artwork});
+			m_definitions.push_back({id, variant, name.GetString(), artwork,
+				FigureElement::Unknown, FigureType::Unknown, GameFromVariant(variant)});
 		};
 		const auto& knownFigures = nsyshid::SkylanderUSB::GetListSkylanders();
 		for (auto figure = document.MemberBegin(); figure != document.MemberEnd(); ++figure)

@@ -177,6 +177,7 @@ private:
 
 	bool m_menu_visible = false;
 	bool m_game_launched = false;
+	bool m_update_success_checked = false;
 
 	#ifdef ENABLE_DISCORD_RPC
 	std::unique_ptr<DiscordPresence> m_discord;

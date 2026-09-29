@@ -133,9 +133,6 @@ namespace nsyshid
 		std::lock_guard<std::recursive_mutex> lock(hidMutex);
 		InitHIDPoolIndexQueue();
 		size_t index = device - HIDPool.GetPtr();
-		// Attach/detach callbacks contain a guest pointer to this HID record and
-		// are executed asynchronously. Reusing the record immediately lets a new
-		// device overwrite it before the detach callback has consumed it.
 		HIDRetiredIndexQueue.push({index, std::chrono::steady_clock::now() + std::chrono::seconds(2)});
 	}
 

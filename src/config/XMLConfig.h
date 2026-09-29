@@ -426,15 +426,28 @@ public:
 
 		fflush(file);
 		fclose(file);
+		if (!success)
+		{
+			fs::remove(tmp_name, err);
+			return false;
+		}
 
+		err.clear();
+#if BOOST_OS_WINDOWS
+		if (!MoveFileExW(tmp_name.c_str(), filename.c_str(),
+			MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+			err = std::error_code(static_cast<int>(GetLastError()), std::system_category());
+#else
 		fs::rename(tmp_name, filename, err);
+#endif
 		if(err)
 		{
 			cemuLog_log(LogType::Force, "Unable to save settings to file: {}", err.message().c_str());
 			fs::remove(tmp_name, err);
+			return false;
 		}
 
-		return success;
+		return true;
 	}
 
 	[[nodiscard]] const std::wstring& GetFilename() const { return m_filename; }

@@ -32,6 +32,17 @@ namespace skylander_ui
 		RacingDriver,
 	};
 
+	enum class FigureGame : uint8
+	{
+		Unknown,
+		SpyrosAdventure,
+		Giants,
+		SwapForce,
+		TrapTeam,
+		SuperChargers,
+		Imaginators,
+	};
+
 	struct FigureDefinition
 	{
 		uint16 id{};
@@ -40,6 +51,7 @@ namespace skylander_ui
 		fs::path imagePath;
 		FigureElement element{FigureElement::Unknown};
 		FigureType type{FigureType::Unknown};
+		FigureGame game{FigureGame::Unknown};
 	};
 
 	struct CollectionFigure

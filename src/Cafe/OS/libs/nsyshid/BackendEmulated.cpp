@@ -12,7 +12,10 @@ namespace nsyshid::backend::emulated
 		cemuLog_logDebug(LogType::Force, "nsyshid::BackendEmulated: emulated backend initialised");
 	}
 
-	BackendEmulated::~BackendEmulated() = default;
+	BackendEmulated::~BackendEmulated()
+	{
+		g_skyportal.StopHybrid();
+	}
 
 	bool BackendEmulated::IsInitialisedOk()
 	{
@@ -21,12 +24,14 @@ namespace nsyshid::backend::emulated
 
 	void BackendEmulated::RefreshSkylanderPortal()
 	{
+		const sint32 mode = GetConfig().emulated_usb_devices.skylander_portal_mode.GetValue();
 		auto portal = FindDevice([](const std::shared_ptr<Device>& device) {
 			return device->m_vendorId == 0x1430 && device->m_productId == 0x0150;
 		});
 
-		if (!GetConfig().emulated_usb_devices.emulate_skylander_portal)
+		if (mode == 1)
 		{
+			g_skyportal.StopHybrid();
 			if (portal)
 				DetachDevice(portal);
 			return;
@@ -37,6 +42,11 @@ namespace nsyshid::backend::emulated
 			cemuLog_logDebug(LogType::Force, "Attaching Emulated Skylanders Portal");
 			AttachDevice(std::make_shared<SkylanderPortalDevice>());
 		}
+
+		if (mode == 2)
+			g_skyportal.StartHybrid();
+		else
+			g_skyportal.StopHybrid();
 	}
 
 	void BackendEmulated::AttachVisibleDevices()
@@ -57,4 +67,4 @@ namespace nsyshid::backend::emulated
 			AttachDevice(device);
 		}
 	}
-} // namespace nsyshid::backend::emulated
+}

@@ -522,7 +522,7 @@ struct CemuConfig
 	{
 		ConfigValue<bool> emulate_skylander_portal{false};
 		ConfigValue<sint32> skylander_portal_mode{1};
-		ConfigValue<bool> skylander_hybrid_mode_enabled{false};
+		ConfigValue<bool> skylander_hybrid_mode_enabled{true};
 		ConfigValue<std::string> skylander_collection_path{""};
 		ConfigValue<sint32> skylander_sort_mode{0};
 		ConfigValue<std::string> skylander_favorites{""};
@@ -535,10 +535,12 @@ struct CemuConfig
 		ConfigValue<sint32> skylander_haptic_strength{2};
 		ConfigValue<sint32> skylander_theme{0};
 		ConfigValue<sint32> skylander_accent{0};
+		ConfigValue<uint32> skylander_custom_theme{0x2F7CA0};
+		ConfigValue<uint32> skylander_custom_accent{0x4FD3FF};
 		ConfigValue<sint32> skylander_card_effect{2};
 		ConfigValue<sint32> skylander_card_border{1};
 		ConfigValue<sint32> skylander_card_texture{1};
-		ConfigValue<sint32> skylander_cascade_style{0};
+		ConfigValue<sint32> skylander_cascade_style{2};
         ConfigValue<sint32> skylander_hub_layout{1};
         ConfigValue<sint32> skylander_hub_ornament{1};
         ConfigValue<std::string> skylander_hub_palette{""};
@@ -548,6 +550,8 @@ struct CemuConfig
 		ConfigValue<sint32> skylander_corner_style{1};
 		ConfigValue<sint32> skylander_drawer_opacity{86};
 		ConfigValue<sint32> skylander_card_density{9};
+		ConfigValue<sint32> skylander_cascade_rows_layout{0};
+		ConfigValue<std::string> skylander_cascade_rows{"1,0,0;2,0,0;0,4,0"};
 		ConfigValue<sint32> skylander_priority_mode{0};
 		ConfigValue<sint32> skylander_filter_mode{0};
 		ConfigValue<sint32> skylander_element_priority{0};

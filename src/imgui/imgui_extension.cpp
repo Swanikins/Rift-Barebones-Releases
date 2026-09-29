@@ -57,8 +57,6 @@ void ImGui_PrecacheFonts()
 	{
 		const int size = g_font_requests.top();
 		g_font_requests.pop();
-		// Many labels request the same missing size in a single frame. Adding it
-		// repeatedly inflates the atlas and stalls fullscreen menu initialization.
 		if (g_imgui_fonts.contains(size))
 			continue;
 		
@@ -106,7 +104,6 @@ void ImGui_PrecacheFonts()
 	}
 	if (addedFonts)
 	{
-		// Flush and invalidate once for the entire batch, before the next frame.
 		g_renderer->Flush(true);
 		g_renderer->DeleteFontTextures();
 	}

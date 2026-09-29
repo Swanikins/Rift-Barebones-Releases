@@ -99,10 +99,13 @@ SkylanderManagerFrame::SkylanderManagerFrame(wxWindow* parent)
 
 	m_physicalButton = new wxButton(this, wxID_ANY, _("Physical Portal"));
 	m_virtualButton = new wxButton(this, wxID_ANY, _("Virtual Portal"));
+	m_hybridButton = new wxButton(this, wxID_ANY, _("Hybrid Portal"));
 	header->Add(m_physicalButton, 0, wxRIGHT, 8);
-	header->Add(m_virtualButton);
-	m_physicalButton->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { SetPortalMode(false); });
-	m_virtualButton->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { SetPortalMode(true); });
+	header->Add(m_virtualButton, 0, wxRIGHT, 8);
+	header->Add(m_hybridButton);
+	m_physicalButton->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { SetPortalMode(1); });
+	m_virtualButton->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { SetPortalMode(0); });
+	m_hybridButton->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { SetPortalMode(2); });
 	root->Add(header, 0, wxEXPAND | wxALL, 20);
 	root->Add(new wxStaticLine(this), 0, wxEXPAND | wxLEFT | wxRIGHT, 20);
 
@@ -156,7 +159,7 @@ SkylanderManagerFrame::SkylanderManagerFrame(wxWindow* parent)
 	auto* portalPanel = new wxPanel(this);
 	portalPanel->SetBackgroundColour(kPanel);
 	auto* portalSizer = new wxBoxSizer(wxVERTICAL);
-	auto* portalTitle = new wxStaticText(portalPanel, wxID_ANY, _("VIRTUAL PORTAL"));
+	auto* portalTitle = new wxStaticText(portalPanel, wxID_ANY, _("PORTAL LOADOUT"));
 	portalTitle->SetForegroundColour(kMuted);
 	portalSizer->Add(portalTitle, 0, wxALL, 14);
 	m_portalList = new SkylanderListBox(portalPanel);
@@ -201,9 +204,10 @@ SkylanderManagerFrame::SkylanderManagerFrame(wxWindow* parent)
 	place->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { PlaceSelectedFigure(); });
 	remove->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { RemoveSelectedSlot(); });
 
-	const bool virtualPortal = GetConfig().emulated_usb_devices.emulate_skylander_portal.GetValue();
-	m_virtualButton->SetBackgroundColour(virtualPortal ? kAccent : kControl);
-	m_physicalButton->SetBackgroundColour(virtualPortal ? kControl : kAccent);
+	const int portalMode = std::clamp(GetConfig().emulated_usb_devices.skylander_portal_mode.GetValue(), 0, 2);
+	m_virtualButton->SetBackgroundColour(portalMode == 0 ? kAccent : kControl);
+	m_physicalButton->SetBackgroundColour(portalMode == 1 ? kAccent : kControl);
+	m_hybridButton->SetBackgroundColour(portalMode == 2 ? kAccent : kControl);
 	ReloadCatalog();
 	UpdatePortalSlots();
 	Centre();
@@ -290,7 +294,15 @@ void SkylanderManagerFrame::PlaceSelectedFigure()
 	std::array<uint8, nsyshid::SKY_FIGURE_SIZE> data{};
 	if (file->readData(data.data(), data.size()) != data.size()) return;
 	if (m_portalFigures[target])
-		nsyshid::g_skyportal.RemoveSkylander(std::get<0>(*m_portalFigures[target]));
+	{
+		const uint8 existingSlot = std::get<0>(*m_portalFigures[target]);
+		if (!nsyshid::g_skyportal.RemoveSkylander(existingSlot))
+		{
+			wxMessageBox(_("A physical figure occupies that slot. Lift it from the portal or choose another slot."),
+				_("Hybrid Portal"), wxOK | wxICON_INFORMATION, this);
+			return;
+		}
+	}
 	const uint8 portalSlot = nsyshid::g_skyportal.LoadSkylander(data.data(), std::move(file));
 	if (portalSlot == 0xFF) return;
 	m_portalFigures[target] = std::tuple(portalSlot, figure.id, figure.variant);
@@ -301,13 +313,41 @@ void SkylanderManagerFrame::RemoveSelectedSlot()
 {
 	const int selected = m_portalList->GetSelection();
 	if (selected == wxNOT_FOUND || !m_portalFigures[selected]) return;
-	nsyshid::g_skyportal.RemoveSkylander(std::get<0>(*m_portalFigures[selected]));
+	if (!nsyshid::g_skyportal.RemoveSkylander(std::get<0>(*m_portalFigures[selected])))
+	{
+		wxMessageBox(_("Lift physical figures from the portal to remove them."),
+			_("Hybrid Portal"), wxOK | wxICON_INFORMATION, this);
+		return;
+	}
 	m_portalFigures[selected].reset();
 	UpdatePortalSlots();
 }
 
 void SkylanderManagerFrame::UpdatePortalSlots()
 {
+	const auto loaded = nsyshid::g_skyportal.GetLoadedSkylanders();
+	for (auto& displayed : m_portalFigures)
+	{
+		if (!displayed)
+			continue;
+		const auto [portalSlot, id, variant] = *displayed;
+		if (portalSlot >= loaded.size() || !loaded[portalSlot] ||
+			loaded[portalSlot]->first != id || loaded[portalSlot]->second != variant)
+			displayed.reset();
+	}
+	for (uint8 portalSlot = 0; portalSlot < loaded.size(); ++portalSlot)
+	{
+		if (!loaded[portalSlot])
+			continue;
+		const bool displayed = std::any_of(m_portalFigures.begin(), m_portalFigures.end(),
+			[portalSlot](const auto& entry) { return entry && std::get<0>(*entry) == portalSlot; });
+		if (displayed)
+			continue;
+		const auto empty = std::find(m_portalFigures.begin(), m_portalFigures.end(), std::nullopt);
+		if (empty != m_portalFigures.end())
+			*empty = std::tuple(portalSlot, loaded[portalSlot]->first, loaded[portalSlot]->second);
+	}
+
 	m_portalList->Clear();
 	for (size_t i = 0; i < m_portalFigures.size(); ++i)
 	{
@@ -316,24 +356,26 @@ void SkylanderManagerFrame::UpdatePortalSlots()
 		{
 			const auto [portalSlot, id, variant] = *m_portalFigures[i];
 			const auto* definition = m_catalog.Find(id, variant);
-			label = wxString::Format("%02zu   %s", i + 1,
-				definition ? wxHelper::FromUtf8(definition->name) : _("Unknown"));
+			const auto snapshot = nsyshid::g_skyportal.GetSkylanderSnapshot(portalSlot);
+			label = wxString::Format("%02zu   %s%s", i + 1,
+				definition ? wxHelper::FromUtf8(definition->name) : _("Unknown"),
+				snapshot && snapshot->physical ? _("  [PHYSICAL]") : wxString{});
 		}
 		m_portalList->Append(label);
 	}
 }
 
-void SkylanderManagerFrame::SetPortalMode(bool virtualPortal)
+void SkylanderManagerFrame::SetPortalMode(int mode)
 {
-	const int requestedMode = virtualPortal ? 0 : 1;
-	if (GetConfig().emulated_usb_devices.emulate_skylander_portal.GetValue() != virtualPortal ||
-		GetConfig().emulated_usb_devices.skylander_portal_mode.GetValue() != requestedMode)
+	mode = std::clamp(mode, 0, 2);
+	if (GetConfig().emulated_usb_devices.skylander_portal_mode.GetValue() != mode)
 	{
-		GetConfig().emulated_usb_devices.skylander_portal_mode = requestedMode;
-		GetConfig().emulated_usb_devices.emulate_skylander_portal = virtualPortal;
+		GetConfig().emulated_usb_devices.skylander_portal_mode = mode;
+		GetConfig().emulated_usb_devices.emulate_skylander_portal = mode != 1;
 		g_config.Save();
-		nsyshid::backend::SetSkylanderPortalEmulation(virtualPortal);
+		nsyshid::backend::SetSkylanderPortalMode(mode);
 	}
-	m_virtualButton->SetBackgroundColour(virtualPortal ? kAccent : kControl);
-	m_physicalButton->SetBackgroundColour(virtualPortal ? kControl : kAccent);
+	m_virtualButton->SetBackgroundColour(mode == 0 ? kAccent : kControl);
+	m_physicalButton->SetBackgroundColour(mode == 1 ? kAccent : kControl);
+	m_hybridButton->SetBackgroundColour(mode == 2 ? kAccent : kControl);
 }

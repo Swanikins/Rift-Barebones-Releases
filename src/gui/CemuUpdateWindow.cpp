@@ -15,6 +15,7 @@
 
 #include <limits>
 #include <optional>
+#include <stdexcept>
 #ifndef BOOST_OS_WINDOWS
 #include <unistd.h>
 #include <sys/stat.h>
@@ -668,6 +669,12 @@ void CemuUpdateWindow::WorkerThread()
 							wxQueueEvent(this, event);
 						}
 					}
+
+					auto updateMarker = std::unique_ptr<FileStream>(FileStream::createFile2(
+						exePath.parent_path() / RiftVersion::UpdateSuccessMarker));
+					if (!updateMarker)
+						throw std::runtime_error("Could not create the Rift update success marker");
+					updateMarker->writeLine(m_latestTag.c_str());
 				}
 				catch (const std::exception& ex)
 				{

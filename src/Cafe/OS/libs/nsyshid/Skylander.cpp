@@ -560,6 +560,7 @@ namespace nsyshid
 
 	Device::WriteResult SkylanderPortalDevice::Write(WriteMessage* message)
 	{
+		g_skyportal.QueueAudio(message->data, message->length);
 		message->bytesWritten = message->length;
 		return Device::WriteResult::Success;
 	}
@@ -740,18 +741,28 @@ namespace nsyshid
 			break;
 		}
 		default:
-			// A transfer already queued by the game can finish while the virtual
-			// portal is being detached. Unknown commands are a USB protocol error,
-			// not an emulator invariant, so never raise Cemu's fatal assert dialog.
 			cemuLog_log(LogType::Force,
 				"Skylanders portal: ignored unsupported control command 0x{:02x}", buf[0]);
 			break;
 		}
-		if (interruptResponse[0] != 0)
+		if (buf[0] == 'C' || buf[0] == 'J' || buf[0] == 'L' || buf[0] == 'M')
 		{
-			std::lock_guard lock(m_skyMutex);
-			m_queries.push(interruptResponse);
+			std::shared_ptr<PhysicalPortalBridge> bridge;
+			{
+				std::lock_guard lock(m_skyMutex);
+				bridge = m_bridge;
+			}
+			if (bridge)
+				bridge->QueueCommand(buf, length);
 		}
+		if (interruptResponse[0] != 0)
+			QueueResponse(interruptResponse);
+	}
+
+	void SkylanderUSB::QueueResponse(const std::array<uint8, 64>& response)
+	{
+		std::lock_guard lock(m_queryMutex);
+		m_queries.push(response);
 	}
 
 	void SkylanderUSB::Activate()
@@ -863,7 +874,10 @@ namespace nsyshid
 			auto& skylander = m_skylanders[foundSlot];
 			memcpy(skylander.data.data(), buf, skylander.data.size());
 			skylander.skyFile = std::move(file);
+			skylander.physical = false;
+			skylander.physicalPortalIndex = 0;
 			skylander.status = Skylander::ADDED;
+			skylander.queuedStatus = {};
 			skylander.queuedStatus.push(Skylander::ADDED);
 			skylander.queuedStatus.push(Skylander::READY);
 			skylander.lastId = skySerial;
@@ -880,6 +894,8 @@ namespace nsyshid
 
 		if (thesky.status & 1)
 		{
+			if (thesky.physical)
+				return false;
 			thesky.status = 2;
 			thesky.queuedStatus.push(2);
 			thesky.queuedStatus.push(0);
@@ -908,9 +924,6 @@ namespace nsyshid
 		{
 			memcpy(&data[(index * 0x40) + 0x36], &other_blocks, sizeof(other_blocks));
 		}
-		// Seed once instead of asking the operating system for entropy every time
-		// the UI creates a figure. Repeated random_device construction can stall
-		// the main window on some Windows systems.
 		static std::mutex randomMutex;
 		static std::mt19937 mt([] {
 			std::random_device rd;
@@ -962,7 +975,8 @@ namespace nsyshid
 		const auto& figure = m_skylanders[skyNum];
 		if (!(figure.status & 1))
 			return std::nullopt;
-		return FigureSnapshot{figure.data, figure.skyFile != nullptr};
+		return FigureSnapshot{figure.data, figure.skyFile != nullptr,
+			figure.physical, figure.physicalPortalIndex};
 	}
 
 	void SkylanderUSB::QueryBlock(uint8 skyNum, uint8 block, uint8* replyBuf)
@@ -989,46 +1003,90 @@ namespace nsyshid
 	void SkylanderUSB::WriteBlock(uint8 skyNum, uint8 block,
 								  const uint8* toWriteBuf, uint8* replyBuf)
 	{
-		std::lock_guard lock(m_skyMutex);
 		replyBuf[0] = 'W';
 		replyBuf[1] = skyNum;
 		replyBuf[2] = block;
 		if (skyNum >= m_skylanders.size() || block >= 0x40)
 			return;
 
-		auto& skylander = m_skylanders[skyNum];
+		std::shared_ptr<PhysicalPortalBridge> bridge;
+		uint8 physicalPortalIndex = 0;
+		uint32 serial = 0;
+		bool physical = false;
+		{
+			std::lock_guard lock(m_skyMutex);
+			auto& skylander = m_skylanders[skyNum];
+			if (!(skylander.status & 1))
+				return;
 
-		if (skylander.status & 1)
-		{
-			replyBuf[1] = (0x10 | skyNum);
-			memcpy(skylander.data.data() + (block * 16), toWriteBuf, 16);
-			skylander.Save();
+			if (!skylander.physical)
+			{
+				replyBuf[1] = (0x10 | skyNum);
+				memcpy(skylander.data.data() + (block * 16), toWriteBuf, 16);
+				skylander.Save();
+				return;
+			}
+
+			physical = true;
+			physicalPortalIndex = skylander.physicalPortalIndex;
+			serial = skylander.lastId;
+			bridge = m_bridge;
 		}
-		else
+
+		if (physical)
 		{
-			replyBuf[1] = skyNum;
+			replyBuf[0] = 0;
+			std::array<uint8, SKY_BLOCK_SIZE> requestedData{};
+			memcpy(requestedData.data(), toWriteBuf, requestedData.size());
+			if (!bridge)
+			{
+				std::array<uint8, 64> failure{'W', skyNum, block};
+				QueueResponse(failure);
+				return;
+			}
+
+			bridge->QueueWrite(physicalPortalIndex, block, serial, requestedData.data(),
+				[this, skyNum, block, physicalPortalIndex, serial, requestedData](bool success) {
+					std::array<uint8, 64> response{'W', skyNum, block};
+					{
+						std::lock_guard lock(m_skyMutex);
+						if (skyNum < m_skylanders.size())
+						{
+							auto& current = m_skylanders[skyNum];
+							success = success && (current.status & 1) && current.physical &&
+								current.physicalPortalIndex == physicalPortalIndex && current.lastId == serial;
+							if (success)
+							{
+								memcpy(current.data.data() + (block * SKY_BLOCK_SIZE),
+									requestedData.data(), requestedData.size());
+								response[1] = (0x10 | skyNum);
+							}
+						}
+					}
+					QueueResponse(response);
+				});
 		}
 	}
 
 	std::array<uint8, 64> SkylanderUSB::GetStatus()
 	{
-		std::lock_guard lock(m_skyMutex);
 		std::array<uint8, 64> interruptResponse = {};
-
-		if (!m_queries.empty())
 		{
-			interruptResponse = m_queries.front();
-			m_queries.pop();
-			// This needs to happen after ~22 milliseconds
+			std::lock_guard queryLock(m_queryMutex);
+			if (!m_queries.empty())
+			{
+				interruptResponse = m_queries.front();
+				m_queries.pop();
+				return interruptResponse;
+			}
 		}
-		else
+
 		{
+			std::lock_guard lock(m_skyMutex);
 			uint32 status = 0;
 			uint8 active = 0x00;
 			if (m_activated)
-			{
 				active = 0x01;
-			}
 
 			for (int i = 16 - 1; i >= 0; i--)
 			{
@@ -1051,6 +1109,156 @@ namespace nsyshid
 			memcpy(&interruptResponse[1], &status, sizeof(status));
 		}
 		return interruptResponse;
+	}
+
+	void SkylanderUSB::StartHybrid()
+	{
+		std::lock_guard lifecycle(m_hybridMutex);
+		{
+			std::lock_guard lock(m_skyMutex);
+			if (m_bridge)
+				return;
+		}
+
+		auto bridge = std::make_shared<PhysicalPortalBridge>();
+		bridge->SetCallbacks(
+			[this](uint8 portalIndex, const std::array<uint8, SKY_FIGURE_SIZE>& data) {
+				OnPhysicalAdd(portalIndex, data);
+			},
+			[this](uint8 portalIndex) { OnPhysicalRemove(portalIndex); });
+		if (!bridge->Start())
+			return;
+
+		SkylanderLEDColor color;
+		{
+			std::lock_guard lock(m_skyMutex);
+			m_bridge = bridge;
+			color = m_colorRight;
+		}
+		bridge->SetColor(color.red, color.green, color.blue);
+	}
+
+	void SkylanderUSB::StopHybrid()
+	{
+		std::lock_guard lifecycle(m_hybridMutex);
+		std::shared_ptr<PhysicalPortalBridge> bridge;
+		{
+			std::lock_guard lock(m_skyMutex);
+			bridge = std::move(m_bridge);
+		}
+		if (bridge)
+			bridge->Stop();
+	}
+
+	bool SkylanderUSB::IsHybridActive()
+	{
+		std::lock_guard lock(m_skyMutex);
+		return m_bridge != nullptr;
+	}
+
+	bool SkylanderUSB::IsHybridConnected()
+	{
+		std::shared_ptr<PhysicalPortalBridge> bridge;
+		{
+			std::lock_guard lock(m_skyMutex);
+			bridge = m_bridge;
+		}
+		return bridge && bridge->IsConnected();
+	}
+
+	void SkylanderUSB::QueueAudio(const uint8* data, uint32 length)
+	{
+		std::shared_ptr<PhysicalPortalBridge> bridge;
+		{
+			std::lock_guard lock(m_skyMutex);
+			bridge = m_bridge;
+		}
+		if (bridge)
+			bridge->QueueAudio(data, length);
+	}
+
+	void SkylanderUSB::OnPhysicalAdd(uint8 portalIndex,
+		const std::array<uint8, SKY_FIGURE_SIZE>& data)
+	{
+		if (portalIndex >= MAX_SKYLANDERS)
+			return;
+		std::lock_guard lock(m_skyMutex);
+		const uint32 serial = static_cast<uint32>(data[0]) |
+			(static_cast<uint32>(data[1]) << 8) |
+			(static_cast<uint32>(data[2]) << 16) |
+			(static_cast<uint32>(data[3]) << 24);
+
+		for (uint8 logical = 0; logical < MAX_SKYLANDERS; ++logical)
+		{
+			auto& existing = m_skylanders[logical];
+			if (!existing.physical || existing.physicalPortalIndex != portalIndex)
+				continue;
+
+			if ((existing.status & 1) && existing.lastId == serial)
+				return;
+			memcpy(existing.data.data(), data.data(), data.size());
+			existing.skyFile.reset();
+			existing.lastId = serial;
+			existing.status = Skylander::REMOVING;
+			existing.queuedStatus = {};
+			existing.queuedStatus.push(Skylander::REMOVED);
+			existing.queuedStatus.push(Skylander::ADDED);
+			existing.queuedStatus.push(Skylander::READY);
+			return;
+		}
+
+		uint8 logical = 0xFF;
+		if ((m_skylanders[portalIndex].status & 1) == 0 && !m_skylanders[portalIndex].physical)
+			logical = portalIndex;
+		else
+		{
+			for (uint8 candidate = 0; candidate < MAX_SKYLANDERS; ++candidate)
+			{
+				if ((m_skylanders[candidate].status & 1) == 0 && !m_skylanders[candidate].physical)
+				{
+					logical = candidate;
+					break;
+				}
+			}
+		}
+		if (logical == 0xFF)
+		{
+			cemuLog_log(LogType::Force,
+				"Rift hybrid: physical portal slot {} could not be mapped because all logical slots are occupied",
+				portalIndex);
+			return;
+		}
+
+		auto& figure = m_skylanders[logical];
+		memcpy(figure.data.data(), data.data(), data.size());
+		figure.skyFile.reset();
+		figure.physical = true;
+		figure.physicalPortalIndex = portalIndex;
+		figure.lastId = serial;
+		figure.status = Skylander::ADDED;
+		figure.queuedStatus = {};
+		figure.queuedStatus.push(Skylander::ADDED);
+		figure.queuedStatus.push(Skylander::READY);
+		cemuLog_log(LogType::Force, "Rift hybrid: physical portal slot {} mapped to logical slot {}",
+			portalIndex, logical);
+	}
+
+	void SkylanderUSB::OnPhysicalRemove(uint8 portalIndex)
+	{
+		std::lock_guard lock(m_skyMutex);
+		for (uint8 logical = 0; logical < MAX_SKYLANDERS; ++logical)
+		{
+			auto& figure = m_skylanders[logical];
+			if (!figure.physical || figure.physicalPortalIndex != portalIndex)
+				continue;
+			figure.status = Skylander::REMOVING;
+			figure.queuedStatus = {};
+			figure.queuedStatus.push(Skylander::REMOVING);
+			figure.queuedStatus.push(Skylander::REMOVED);
+			figure.physical = false;
+			figure.physicalPortalIndex = 0;
+			return;
+		}
 	}
 
 	std::string SkylanderUSB::FindSkylander(uint16 skyId, uint16 skyVar)
@@ -1078,4 +1286,4 @@ namespace nsyshid
 		skyFile->SetPosition(0);
 		skyFile->writeData(data.data(), data.size());
 	}
-} // namespace nsyshid
+}

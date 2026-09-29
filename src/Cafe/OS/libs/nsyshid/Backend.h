@@ -188,6 +188,6 @@ namespace nsyshid
 	namespace backend
 	{
 		void AttachDefaultBackends();
-		void SetSkylanderPortalEmulation(bool emulatePortal);
+		void SetSkylanderPortalMode(sint32 mode);
 	}
 } // namespace nsyshid

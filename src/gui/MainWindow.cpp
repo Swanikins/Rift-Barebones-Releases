@@ -1,6 +1,7 @@
 #include "gui/wxgui.h"
 #include "gui/MainWindow.h"
 #include "gui/guiWrapper.h"
+#include "Common/RiftVersion.h"
 
 #include <wx/mstream.h>
 #include <wx/clipbrd.h>
@@ -118,6 +119,7 @@ enum
 	MAINFRAME_MENU_ID_SKYLANDERS_QUICK_MENU,
 	MAINFRAME_MENU_ID_SKYLANDERS_PHYSICAL,
 	MAINFRAME_MENU_ID_SKYLANDERS_VIRTUAL,
+	MAINFRAME_MENU_ID_SKYLANDERS_HYBRID,
 	// cpu
 	// cpu->timer speed
 	MAINFRAME_MENU_ID_TIMER_SPEED_1X = 20700,
@@ -199,6 +201,7 @@ EVT_MENU(MAINFRAME_MENU_ID_TOOLS_SKYLANDER_MANAGER, MainWindow::OnToolsInput)
 EVT_MENU(MAINFRAME_MENU_ID_SKYLANDERS_QUICK_MENU, MainWindow::OnToolsInput)
 EVT_MENU(MAINFRAME_MENU_ID_SKYLANDERS_PHYSICAL, MainWindow::OnToolsInput)
 EVT_MENU(MAINFRAME_MENU_ID_SKYLANDERS_VIRTUAL, MainWindow::OnToolsInput)
+EVT_MENU(MAINFRAME_MENU_ID_SKYLANDERS_HYBRID, MainWindow::OnToolsInput)
 // cpu menu
 EVT_MENU(MAINFRAME_MENU_ID_TIMER_SPEED_8X, MainWindow::OnDebugSetting)
 EVT_MENU(MAINFRAME_MENU_ID_TIMER_SPEED_4X, MainWindow::OnDebugSetting)
@@ -867,7 +870,7 @@ void MainWindow::OpenSettings()
 		m_discord.reset();
 	#endif
 
-	if(config.check_update && !m_game_launched)
+	if(config.check_update && !m_game_launched && !m_update_available.valid())
 		m_update_available = CemuUpdateWindow::IsUpdateAvailableAsync();
 
 	if (mlc_modified)
@@ -1279,7 +1282,7 @@ void MainWindow::LoadSettings()
 	g_config.Load();
 	const auto& config = GetConfig();
 
-	if(config.check_update)
+	if(config.check_update && !m_update_available.valid())
 		m_update_available = CemuUpdateWindow::IsUpdateAvailableAsync();
 
 	if (config.window_position != Vector2i{ -1,-1 })
@@ -1466,6 +1469,23 @@ void MainWindow::OnKeyDown(wxKeyEvent& event)
 
 void MainWindow::OnChar(wxKeyEvent& event)
 {
+	const auto unicode = event.GetUnicodeKey();
+	unsigned int codepoint = unicode == WXK_NONE ? 0u : static_cast<unsigned int>(unicode);
+	if (unicode == WXK_NONE)
+	{
+		switch (event.GetKeyCode())
+		{
+		case WXK_BACK: codepoint = 8; break;
+		case WXK_RETURN:
+		case WXK_NUMPAD_ENTER: codepoint = 13; break;
+		case WXK_ESCAPE: codepoint = 27; break;
+		case WXK_DELETE: codepoint = 127; break;
+		default: break;
+		}
+	}
+	if (SkylanderQuickMenu_HandleCharacter(codepoint))
+		return;
+
 	if (swkbd_hasKeyboardInputHook())
 		swkbd_keyInput(event.GetUnicodeKey());
 	
@@ -1553,12 +1573,14 @@ void MainWindow::OnToolsInput(wxCommandEvent& event)
 		break;
 	case MAINFRAME_MENU_ID_SKYLANDERS_PHYSICAL:
 	case MAINFRAME_MENU_ID_SKYLANDERS_VIRTUAL:
+	case MAINFRAME_MENU_ID_SKYLANDERS_HYBRID:
 	{
-		const bool virtualPortal = id == MAINFRAME_MENU_ID_SKYLANDERS_VIRTUAL;
-		GetConfig().emulated_usb_devices.skylander_portal_mode = virtualPortal ? 0 : 1;
-		GetConfig().emulated_usb_devices.emulate_skylander_portal = virtualPortal;
+		const int mode = id == MAINFRAME_MENU_ID_SKYLANDERS_VIRTUAL ? 0 :
+			(id == MAINFRAME_MENU_ID_SKYLANDERS_PHYSICAL ? 1 : 2);
+		GetConfig().emulated_usb_devices.skylander_portal_mode = mode;
+		GetConfig().emulated_usb_devices.emulate_skylander_portal = mode != 1;
 		g_config.Save();
-		nsyshid::backend::SetSkylanderPortalEmulation(virtualPortal);
+		nsyshid::backend::SetSkylanderPortalMode(mode);
 		break;
 	}
 	break;
@@ -1811,13 +1833,27 @@ bool MainWindow::IsMenuHidden() const
 
 void MainWindow::OnTimer(wxTimerEvent& event)
 {
+	if (!m_update_success_checked)
+	{
+		m_update_success_checked = true;
+		const fs::path markerPath = ActiveSettings::GetExecutablePath().parent_path() /
+			RiftVersion::UpdateSuccessMarker;
+		std::error_code markerError;
+		if (fs::is_regular_file(markerPath, markerError) && !markerError)
+		{
+			fs::remove(markerPath, markerError);
+			wxMessageBox(_("Rift updated successfully."), _("Rift update"),
+				wxOK | wxCENTRE | wxICON_INFORMATION, this);
+		}
+	}
+
 	if (SkylanderQuickMenu_ConsumeUpdateCheckRequest())
 	{
 		CemuUpdateWindow updateWindow(this);
 		updateWindow.ShowModal();
 	}
 
-	if(m_update_available.valid() && future_is_ready(m_update_available))
+	if(GetConfig().check_update && !m_game_launched && m_update_available.valid() && future_is_ready(m_update_available))
 	{
 		if(m_update_available.get())
 		{
@@ -2206,15 +2242,16 @@ void MainWindow::RecreateMenu()
 	optionsMenu->AppendSubMenu(optionsConsoleLanguageMenu, _("&Console language"));
 	m_menuBar->Append(optionsMenu, _("&Options"));
 
-	// Skylanders is the purpose of this build, so its controls live at the top level.
 	wxMenu* skylandersMenu = new wxMenu();
 	skylandersMenu->Append(MAINFRAME_MENU_ID_SKYLANDERS_QUICK_MENU, _("Open &Rift of Power\tF7"));
 	skylandersMenu->Append(MAINFRAME_MENU_ID_TOOLS_SKYLANDER_MANAGER, _("Open Desktop &Manager\tF8"));
 	skylandersMenu->AppendSeparator();
 	skylandersMenu->AppendRadioItem(MAINFRAME_MENU_ID_SKYLANDERS_VIRTUAL, _("Use &Virtual Portal"), wxEmptyString)
-		->Check(config.emulated_usb_devices.emulate_skylander_portal);
+		->Check(config.emulated_usb_devices.skylander_portal_mode.GetValue() == 0);
 	skylandersMenu->AppendRadioItem(MAINFRAME_MENU_ID_SKYLANDERS_PHYSICAL, _("Use &Physical Portal"), wxEmptyString)
-		->Check(!config.emulated_usb_devices.emulate_skylander_portal);
+		->Check(config.emulated_usb_devices.skylander_portal_mode.GetValue() == 1);
+	skylandersMenu->AppendRadioItem(MAINFRAME_MENU_ID_SKYLANDERS_HYBRID, _("Use &Hybrid Portal"), wxEmptyString)
+		->Check(config.emulated_usb_devices.skylander_portal_mode.GetValue() == 2);
 	m_menuBar->Append(skylandersMenu, _("&Skylanders"));
 
 	// tools submenu
@@ -2374,12 +2411,13 @@ void MainWindow::UpdateChildWindowTitleRunningState()
 
 void MainWindow::RestoreSettingsAfterGameExited()
 {
+	if (GetConfig().check_update && !m_update_available.valid())
+		m_update_available = CemuUpdateWindow::IsUpdateAvailableAsync();
 	RecreateMenu();
 }
 
 void MainWindow::UpdateSettingsAfterGameLaunch()
 {
-	m_update_available = {};
 	RecreateMenu();
 }
 

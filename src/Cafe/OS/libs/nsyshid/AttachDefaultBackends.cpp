@@ -31,23 +31,18 @@ namespace nsyshid::backend
 		}
 	}
 
-	void SetSkylanderPortalEmulation(bool emulatePortal)
+	void SetSkylanderPortalMode(sint32 mode)
 	{
 		std::lock_guard<std::mutex> switchLock(s_skylanderPortalSwitchMutex);
-		cemuLog_log(LogType::Force, "Skylanders portal: switching to {} portal",
-			emulatePortal ? "virtual" : "physical");
+		mode = std::clamp<sint32>(mode, 0, 2);
+		const char* modeName = mode == 0 ? "virtual" : mode == 1 ? "physical" : "hybrid";
+		cemuLog_log(LogType::Force, "Skylanders portal: switching to {} portal", modeName);
 
-		// Detach the old portal before exposing the replacement. This ordering is
-		// important for games that poll HID very frequently via the portal
-		// stability graphic pack.
-		if (emulatePortal)
+		if (mode != 1)
 		{
 			if (auto backend = s_backendLibusb.lock())
 				backend->RefreshSkylanderPortal();
 
-			// Device removal callbacks are queued onto the emulated CPU. Reusing the
-			// HID slot immediately can make the queued removal refer to the newly
-			// attached portal instead. Let the removal reach the game first.
 			std::this_thread::sleep_for(std::chrono::milliseconds(250));
 
 			if (auto backend = s_backendEmulated.lock())

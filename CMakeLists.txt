@@ -10,7 +10,7 @@ set(EMULATOR_VERSION_MINOR "0" CACHE STRING "")
 set(EMULATOR_VERSION_PATCH "0" CACHE STRING "")
 
 execute_process(
-		COMMAND git log --format=%h -1
+		COMMAND git -c safe.directory=${CMAKE_CURRENT_LIST_DIR} log --format=%h -1
 		WORKING_DIRECTORY ${CMAKE_CURRENT_LIST_DIR}
 		OUTPUT_VARIABLE GIT_HASH
 		OUTPUT_STRIP_TRAILING_WHITESPACE
@@ -20,7 +20,7 @@ add_definitions(-DEMULATOR_HASH=${GIT_HASH})
 if (ENABLE_VCPKG)
 	# check if vcpkg is shallow and unshallow it if necessary
 	execute_process(
-	COMMAND git rev-parse --is-shallow-repository
+	COMMAND git -c safe.directory=${CMAKE_SOURCE_DIR}/dependencies/vcpkg rev-parse --is-shallow-repository
 	WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/dependencies/vcpkg
 	OUTPUT_VARIABLE is_vcpkg_shallow
 	OUTPUT_STRIP_TRAILING_WHITESPACE
@@ -29,7 +29,7 @@ if (ENABLE_VCPKG)
 	if(is_vcpkg_shallow STREQUAL "true")
 		message(STATUS "vcpkg is shallow. Unshallowing it now...")
 		execute_process(
-			COMMAND git fetch --unshallow
+			COMMAND git -c safe.directory=${CMAKE_SOURCE_DIR}/dependencies/vcpkg fetch --unshallow
 			WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/dependencies/vcpkg"
 			RESULT_VARIABLE result
 			OUTPUT_VARIABLE output

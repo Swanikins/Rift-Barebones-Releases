@@ -1,9 +1,11 @@
 #pragma once
 
+#include <memory>
 #include <mutex>
 
 #include "nsyshid.h"
 #include "Backend.h"
+#include "PhysicalPortalBridge.h"
 
 #include "Common/FileStream.h"
 
@@ -53,6 +55,8 @@ namespace nsyshid
 		{
 			std::array<uint8, SKY_FIGURE_SIZE> data{};
 			bool hasBackingFile{};
+			bool physical{};
+			uint8 physicalPortalIndex{};
 		};
 
 		struct Skylander final
@@ -62,6 +66,8 @@ namespace nsyshid
 			std::queue<uint8> queuedStatus;
 			std::array<uint8, SKY_FIGURE_SIZE> data{};
 			uint32 lastId = 0;
+			bool physical = false;
+			uint8 physicalPortalIndex = 0;
 			void Save();
 
 			enum : uint8
@@ -96,6 +102,13 @@ namespace nsyshid
 		bool CreateSkylander(fs::path pathName, uint16 skyId, uint16 skyVar);
 		std::array<std::optional<std::pair<uint16, uint16>>, MAX_SKYLANDERS> GetLoadedSkylanders();
 		std::optional<FigureSnapshot> GetSkylanderSnapshot(uint8 skyNum);
+		void StartHybrid();
+		void StopHybrid();
+		bool IsHybridActive();
+		bool IsHybridConnected();
+		void QueueAudio(const uint8* data, uint32 length);
+		void OnPhysicalAdd(uint8 portalIndex, const std::array<uint8, SKY_FIGURE_SIZE>& data);
+		void OnPhysicalRemove(uint8 portalIndex);
 		uint16 SkylanderCRC16(uint16 initValue, const uint8* buffer, uint32 size);
 		static const std::map<const std::pair<const uint16, const uint16>, const char*>& GetListSkylanders();
 		std::string FindSkylander(uint16 skyId, uint16 skyVar);
@@ -105,12 +118,16 @@ namespace nsyshid
 		std::array<Skylander, MAX_SKYLANDERS> m_skylanders;
 
 	  private:
+		void QueueResponse(const std::array<uint8, 64>& response);
 		std::queue<std::array<uint8, 64>> m_queries;
+		std::mutex m_queryMutex;
+		std::mutex m_hybridMutex;
 		bool m_activated = true;
 		uint8 m_interruptCounter = 0;
 		SkylanderLEDColor m_colorRight = {};
 		SkylanderLEDColor m_colorLeft = {};
 		SkylanderLEDColor m_colorTrap = {};
+		std::shared_ptr<PhysicalPortalBridge> m_bridge;
 	};
 	extern SkylanderUSB g_skyportal;
-} // namespace nsyshid
+}

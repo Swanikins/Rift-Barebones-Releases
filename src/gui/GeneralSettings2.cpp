@@ -283,18 +283,38 @@ wxPanel* GeneralSettings2::AddGeneralPage(wxNotebook* notebook)
 				wxDD_DEFAULT_STYLE | wxDD_DIR_MUST_EXIST);
 			if (dialog.ShowModal() != wxID_OK)
 				return;
-			collectionPath->ChangeValue(dialog.GetPath());
-			GetConfig().emulated_usb_devices.skylander_collection_path = dialog.GetPath().utf8_string();
-			g_config.Save();
+			auto& configuredPath = GetConfig().emulated_usb_devices.skylander_collection_path;
+			const std::string previousPath = configuredPath.GetValue();
+			std::error_code pathError;
+			fs::path selectedPath = fs::weakly_canonical(wxHelper::MakeFSPath(dialog.GetPath()), pathError);
+			if (pathError)
+				selectedPath = wxHelper::MakeFSPath(dialog.GetPath()).lexically_normal();
+			configuredPath = _pathToUtf8(selectedPath);
+			if (!g_config.Save())
+			{
+				configuredPath = previousPath;
+				wxMessageBox(_("Rift could not save the collection folder. Check that the settings folder is writable and try again."),
+					_("Skylander Collection"), wxOK | wxICON_ERROR, this);
+				return;
+			}
+			collectionPath->ChangeValue(wxHelper::FromPath(selectedPath));
 			SkylanderQuickMenu_Reset();
 		});
 		pathRow->Add(choosePath, 0, wxALL, 5);
 
 		auto* clearPath = new wxButton(collectionBox, wxID_ANY, _("Clear"));
-		clearPath->Bind(wxEVT_BUTTON, [collectionPath](wxCommandEvent&) {
+		clearPath->Bind(wxEVT_BUTTON, [this, collectionPath](wxCommandEvent&) {
+			auto& configuredPath = GetConfig().emulated_usb_devices.skylander_collection_path;
+			const std::string previousPath = configuredPath.GetValue();
+			configuredPath = "";
+			if (!g_config.Save())
+			{
+				configuredPath = previousPath;
+				wxMessageBox(_("Rift could not update the saved collection folder."),
+					_("Skylander Collection"), wxOK | wxICON_ERROR, this);
+				return;
+			}
 			collectionPath->Clear();
-			GetConfig().emulated_usb_devices.skylander_collection_path = "";
-			g_config.Save();
 			SkylanderQuickMenu_Reset();
 		});
 		pathRow->Add(clearPath, 0, wxALL, 5);

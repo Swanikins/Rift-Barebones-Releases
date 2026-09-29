@@ -4,6 +4,11 @@
 
 namespace nsyshid::backend::libusb
 {
+	static bool UsesGuestFacingPhysicalPortal()
+	{
+		return GetConfig().emulated_usb_devices.skylander_portal_mode.GetValue() == 1;
+	}
+
 	BackendLibusb::BackendLibusb()
 		: m_ctx(nullptr),
 		  m_initReturnCode(0),
@@ -78,7 +83,7 @@ namespace nsyshid::backend::libusb
 			return device->m_vendorId == 0x1430 && device->m_productId == 0x0150;
 		});
 
-		if (GetConfig().emulated_usb_devices.emulate_skylander_portal)
+		if (!UsesGuestFacingPhysicalPortal())
 		{
 			if (portal)
 				DetachDevice(portal);
@@ -104,7 +109,7 @@ namespace nsyshid::backend::libusb
 		libusb_device_descriptor desc;
 		if (libusb_get_device_descriptor(dev, &desc) < 0 ||
 			desc.idVendor != 0x1430 || desc.idProduct != 0x0150 ||
-			GetConfig().emulated_usb_devices.emulate_skylander_portal ||
+			!UsesGuestFacingPhysicalPortal() ||
 			FindDeviceById(desc.idVendor, desc.idProduct))
 		{
 			return;
@@ -133,7 +138,7 @@ namespace nsyshid::backend::libusb
 			libusb_device_descriptor desc;
 			if (libusb_get_device_descriptor(dev, &desc) == 0 &&
 				desc.idVendor == 0x1430 && desc.idProduct == 0x0150 &&
-				GetConfig().emulated_usb_devices.emulate_skylander_portal)
+				!UsesGuestFacingPhysicalPortal())
 			{
 				continue;
 			}
@@ -194,7 +199,7 @@ namespace nsyshid::backend::libusb
 						desc.idVendor,
 						desc.idProduct);
 			if (desc.idVendor == 0x1430 && desc.idProduct == 0x0150 &&
-				GetConfig().emulated_usb_devices.emulate_skylander_portal)
+				!UsesGuestFacingPhysicalPortal())
 			{
 				break;
 			}
@@ -528,17 +533,12 @@ namespace nsyshid::backend::libusb
 		if (IsOpened())
 		{
 			auto handle = m_libusbHandle;
-			// Stop new transfers from acquiring the handle, then wait until every
-			// transfer that already acquired it has finished.
 			m_libusbHandle = nullptr;
 			while (m_handleInUseCounter > 0)
 			{
 				m_handleInUseCounterDecremented.wait(lock);
 			}
 
-			// Release interfaces with the saved handle. The regular helper acquires
-			// m_libusbHandle again, but that member is intentionally null by now.
-			// Passing that null handle to libusb caused the live portal switch crash.
 			int configNum = 0;
 			const int configResult = libusb_get_configuration(handle, &configNum);
 			if (configResult == LIBUSB_SUCCESS && configNum >= 0 &&

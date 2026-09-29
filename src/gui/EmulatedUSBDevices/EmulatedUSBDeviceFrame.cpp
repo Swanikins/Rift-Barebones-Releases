@@ -68,17 +68,17 @@ wxPanel* EmulatedUSBDeviceFrame::AddSkylanderPage(wxNotebook* notebook)
 
 	auto* row = new wxBoxSizer(wxHORIZONTAL);
 
-	const wxString portalModes[] = {_("Physical Portal"), _("Virtual Portal")};
+	const wxString portalModes[] = {_("Virtual Portal"), _("Physical Portal"), _("Hybrid Portal")};
 	auto* portalMode = new wxRadioBox(box, wxID_ANY, _("Active Portal"),
 		wxDefaultPosition, wxDefaultSize, std::size(portalModes), portalModes, 1, wxRA_SPECIFY_ROWS);
-	portalMode->SetSelection(GetConfig().emulated_usb_devices.emulate_skylander_portal ? 1 : 0);
-	portalMode->SetToolTip(_("Physical uses a connected non-Xbox Portal of Power. Virtual uses Skylander files managed below."));
+	portalMode->SetSelection(std::clamp(GetConfig().emulated_usb_devices.skylander_portal_mode.GetValue(), 0, 2));
+	portalMode->SetToolTip(_("Virtual uses local figure files. Physical passes the USB portal through to the game. Hybrid combines real figures and local files on one portal."));
 	portalMode->Bind(wxEVT_RADIOBOX, [portalMode](wxCommandEvent&) {
-		const bool emulatePortal = portalMode->GetSelection() == 1;
-		GetConfig().emulated_usb_devices.skylander_portal_mode = emulatePortal ? 0 : 1;
-		GetConfig().emulated_usb_devices.emulate_skylander_portal = emulatePortal;
+		const int mode = portalMode->GetSelection();
+		GetConfig().emulated_usb_devices.skylander_portal_mode = mode;
+		GetConfig().emulated_usb_devices.emulate_skylander_portal = mode != 1;
 		g_config.Save();
-		nsyshid::backend::SetSkylanderPortalEmulation(emulatePortal);
+		nsyshid::backend::SetSkylanderPortalMode(mode);
 	});
 	row->Add(portalMode, 1, wxEXPAND | wxALL, 2);
 	boxSizer->Add(row, 1, wxEXPAND | wxALL, 2);

@@ -36,3 +36,8 @@ Rift's catalog validation and figure identification also reference:
 
 These references document identifiers and data layout. They do not imply endorsement of Rift Barebones.
 
+## Hybrid Portal research and implementation
+
+Rift's simultaneous physical-and-virtual Portal of Power support is adapted from [rhsts/cemu-hybrid-skylander-portal](https://github.com/rhsts/cemu-hybrid-skylander-portal), maintained by rhsts. Rift studied and ported the `hybrid-portal` branch through commit [`df0ff385b126e9821a355a774161bb8536588166`](https://github.com/rhsts/cemu-hybrid-skylander-portal/commit/df0ff385b126e9821a355a774161bb8536588166). The upstream work established the dedicated libusb bridge, physical figure caching, shared physical and virtual slot model, reconnect handling, write forwarding, and LED forwarding used as the basis for Rift's integration.
+
+Those adapted source files and Rift's modifications are covered by the [Mozilla Public License 2.0](../LICENSE.txt). Rift adds its own portal-mode switching, verified physical write-back, collection UI integration, diagnostics, and safeguards around physical slots. Credit belongs to rhsts and the upstream contributors for the original hybrid portal research and implementation.

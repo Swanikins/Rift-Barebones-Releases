@@ -24,7 +24,7 @@ class SkylanderManagerFrame final : public wxFrame
 	void PlaceSelectedFigure();
 	void RemoveSelectedSlot();
 	void UpdatePortalSlots();
-	void SetPortalMode(bool virtualPortal);
+	void SetPortalMode(int mode);
 	void ApplyDarkTheme(wxWindow* window);
 
 	skylander_ui::SkylanderCatalog m_catalog;
@@ -39,4 +39,5 @@ class SkylanderManagerFrame final : public wxFrame
 	SkylanderListBox* m_portalList{};
 	wxButton* m_physicalButton{};
 	wxButton* m_virtualButton{};
+	wxButton* m_hybridButton{};
 };

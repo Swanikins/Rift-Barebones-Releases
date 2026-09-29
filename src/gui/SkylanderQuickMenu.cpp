@@ -1,10 +1,14 @@
 #include "SkylanderQuickMenu.h"
 
 #include <imgui.h>
+#include <rapidjson/document.h>
+#include <rapidjson/prettywriter.h>
+#include <rapidjson/stringbuffer.h>
 #include <wx/image.h>
 #include <wx/log.h>
 #include <condition_variable>
 #include <deque>
+#include <sstream>
 #include <thread>
 #include <tuple>
 #if BOOST_OS_WINDOWS
@@ -21,6 +25,7 @@
 #include "imgui/imgui_extension.h"
 #include "input/InputManager.h"
 #include "input/emulated/EmulatedController.h"
+#include "resource/IconsFontAwesome5.h"
 
 namespace
 {
@@ -34,7 +39,9 @@ namespace
 	constexpr int kLibraryPageSize = kLibraryColumns * kLibraryRows;
 	constexpr int kPortalCapacity = 16;
 	constexpr int kVisiblePortalSlots = 7;
-	constexpr int kOptionCount = 16;
+	constexpr int kOptionCount = 18;
+	constexpr int kLibraryOptionCount = 11;
+	constexpr int kMaximumCascadeRows = 6;
 
 	enum class RiftPage
 	{
@@ -42,6 +49,7 @@ namespace
 		Details,
 		Forge,
 		Options,
+		ColorEditor,
 		LibraryOrder,
 		DeleteConfirm
 	};
@@ -59,7 +67,8 @@ namespace
 	{
 		None,
 		Collection,
-		Create
+		Create,
+		Label
 	};
 
 	enum class SortMode : sint32
@@ -80,6 +89,7 @@ namespace
 		NameDescending,
 		Element,
 		FigureType,
+		Game,
 		Count
 	};
 
@@ -155,7 +165,10 @@ namespace
 		bool detailsWasDown{};
 		bool sortWasDown{};
 		bool favoriteWasDown{};
+		bool startWasDown{};
 		bool hapticActive{};
+		bool mouseNavigationActive{true};
+		bool mousePositionInitialized{};
 		int neutralInputFrames{};
 		int ownerController{-1};
 		float visibility{};
@@ -165,6 +178,7 @@ namespace
 		float placementImpact{};
 		float toastLife{};
 		float pageVisibility{1.0f};
+		float cascadeViewport{-1.0f};
 		int selectedLibrary{};
 		int selectedElementFilter{};
 		int selectedPortalRow{};
@@ -172,11 +186,15 @@ namespace
 		int forgeSortMode{};
 		int forgeTypeFilter{};
 		int forgeElementFilter{};
+		int forgeGameFilter{};
 		int forgeToolbarSelection{};
 		int keyboardRow{};
 		int keyboardColumn{};
 		int selectedOption{};
+		int colorEditorTarget{};
 		int selectedLibraryOption{};
+		int selectedCascadeRow{};
+		int selectedCascadeEditorRow{};
 		int headerSelection{};
 		int placementTargetRow{};
 		uint8 placementSlot{0xFF};
@@ -190,30 +208,47 @@ namespace
 		std::array<float, kPortalCapacity + 1> portalCardX{};
 		std::array<float, 12> elementFilterFocus{};
 		std::array<float, kPortalCapacity + 1> portalCardWidth{};
-		std::array<float, 4> headerFocusAnimations{};
+		std::array<float, 5> headerFocusAnimations{};
+		std::array<float, 5> forgeToolbarFocusAnimations{};
+		std::array<std::array<float, 10>, 5> keyboardFocusAnimations{};
 		std::array<float, kPortalCapacity> portalFocusAnimations{};
 		std::array<float, kOptionCount> optionFocusAnimations{};
-		std::array<float, 5> libraryOptionFocusAnimations{};
+		std::array<std::array<float, 3>, 2> colorEditorHsv{};
+		std::array<ImVec2, 2> colorEditorCursor{};
+		bool colorEditorDirty{};
+		std::array<float, kLibraryOptionCount> libraryOptionFocusAnimations{};
+		std::array<int, kMaximumCascadeRows> cascadeRowPositions{};
+		std::array<float, kMaximumCascadeRows> cascadeRowFocusAnimations{};
 		std::array<double, 4> nextNavigationRepeat{};
 		fs::path placementArtwork;
 		ImU32 placementAccent{IM_COL32(71, 207, 255, 255)};
 		std::string toast;
 		std::array<char, 96> searchText{};
 		std::array<char, 96> forgeSearchText{};
+		std::array<char, 96> labelText{};
+		float keyboardVisibility{};
+		ImVec2 lastMousePosition{};
 		std::chrono::steady_clock::time_point hapticStop{};
 		skylander_ui::SkylanderCatalog catalog;
 		std::vector<skylander_ui::CollectionFigure> library;
 		std::unordered_set<std::string> favorites;
+		std::unordered_map<std::string, std::string> labels;
 		DetailState details;
 	} s_menu;
 
 	std::atomic_uint32_t s_toggleRequests{};
 	std::atomic_bool s_resetRequested{};
 	std::atomic_bool s_updateCheckRequested{};
+	std::atomic_int s_textInputTarget{};
+	std::mutex s_textInputMutex;
+	std::deque<std::pair<int, unsigned int>> s_textInputQueue;
 	std::unordered_map<std::string, ArtworkTexture> s_artworkTextures;
 	std::unordered_map<std::string, float> s_cardFocusAmounts;
 	std::unordered_map<std::string, float> s_cardCarouselOffsets;
+	std::unordered_map<std::string, float> s_cascadeCardFocusAmounts;
+	std::unordered_map<std::string, float> s_cascadeCardOffsets;
 	std::unordered_map<std::string, float> s_forgeFocusAmounts;
+	uint64 s_libraryGeneration{};
 
 	float Clamp01(float value)
 	{
@@ -240,12 +275,49 @@ namespace
 
 	int MotionLevel()
 	{
-		return std::clamp<sint32>(GetConfig().emulated_usb_devices.skylander_motion_level.GetValue(), 0, 2);
+		return std::clamp<sint32>(GetConfig().emulated_usb_devices.skylander_motion_level.GetValue(), 0, 4);
+	}
+
+	float MotionValue(float reduced, float smooth, float floating, float cinematic)
+	{
+		switch (MotionLevel())
+		{
+		case 1: return reduced;
+		case 2: return smooth;
+		case 3: return floating;
+		case 4: return cinematic;
+		default: return 0.0f;
+		}
+	}
+
+	bool AmbientMotionEnabled()
+	{
+		return MotionLevel() >= 2;
+	}
+
+	float AmbientTempo()
+	{
+		return MotionValue(0.0f, 1.0f, 0.72f, 0.52f);
+	}
+
+	float AmbientStrength()
+	{
+		return MotionValue(0.0f, 0.72f, 1.0f, 1.24f);
+	}
+
+	float CarouselResponse()
+	{
+		return MotionValue(16.0f, 7.0f, 5.2f, 4.0f);
 	}
 
 	int BloomLevel()
 	{
 		return std::clamp<sint32>(GetConfig().emulated_usb_devices.skylander_bloom_level.GetValue(), 0, 2);
+	}
+
+	int CardEffect()
+	{
+		return std::clamp<sint32>(GetConfig().emulated_usb_devices.skylander_card_effect.GetValue(), 0, 3);
 	}
 
 	bool MotionEnabled()
@@ -258,7 +330,8 @@ namespace
 		if (!MotionEnabled())
 			return target;
 		const bool fadingOut = target < current;
-		const float speed = MotionLevel() == 2 ? (fadingOut ? 11.5f : 8.5f) : (fadingOut ? 20.0f : 15.0f);
+		const float speed = fadingOut ? MotionValue(18.0f, 9.0f, 7.0f, 5.5f) :
+			MotionValue(14.0f, 7.0f, 5.2f, 4.0f);
 		return SmoothTowards(current, target, speed);
 	}
 
@@ -305,6 +378,101 @@ namespace
 		return result;
 	}
 
+	ImU32 ConfigToColor(uint32 rgb)
+	{
+		return IM_COL32((rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF, 255);
+	}
+
+	uint32 ColorToConfig(ImU32 color)
+	{
+		return ((color & 0xFF) << 16) | (color & 0xFF00) | ((color >> 16) & 0xFF);
+	}
+
+	ImU32 HsvColor(float hue, float saturation, float value)
+	{
+		float red = 0.0f;
+		float green = 0.0f;
+		float blue = 0.0f;
+		ImGui::ColorConvertHSVtoRGB(hue, saturation, value, red, green, blue);
+		return IM_COL32(
+			static_cast<int>(red * 255.0f + 0.5f),
+			static_cast<int>(green * 255.0f + 0.5f),
+			static_cast<int>(blue * 255.0f + 0.5f), 255);
+	}
+
+	void ColorToHsv(ImU32 color, std::array<float, 3>& hsv)
+	{
+		ImGui::ColorConvertRGBtoHSV(
+			static_cast<float>(color & 0xFF) / 255.0f,
+			static_cast<float>((color >> 8) & 0xFF) / 255.0f,
+			static_cast<float>((color >> 16) & 0xFF) / 255.0f,
+			hsv[0], hsv[1], hsv[2]);
+	}
+
+	ImU32 ThemeBaseColor(int theme)
+	{
+		switch (theme)
+		{
+		case 1: return IM_COL32(91, 50, 130, 255);
+		case 2: return IM_COL32(119, 52, 59, 255);
+		case 3: return IM_COL32(45, 113, 76, 255);
+		case 4: return IM_COL32(114, 53, 123, 255);
+		case 5: return ConfigToColor(GetConfig().emulated_usb_devices.skylander_custom_theme.GetValue());
+		default: return IM_COL32(47, 124, 160, 255);
+		}
+	}
+
+	ImU32 ThemeAccentColor(int theme, int accent)
+	{
+		switch (accent)
+		{
+		case 1: return IM_COL32(34, 206, 255, 255);
+		case 2: return IM_COL32(181, 78, 255, 255);
+		case 3: return IM_COL32(255, 181, 24, 255);
+		case 4: return IM_COL32(43, 232, 122, 255);
+		case 5: return IM_COL32(255, 72, 56, 255);
+		case 6: return ConfigToColor(GetConfig().emulated_usb_devices.skylander_custom_accent.GetValue());
+		default: break;
+		}
+		switch (theme)
+		{
+		case 1: return IM_COL32(174, 91, 255, 255);
+		case 2: return IM_COL32(255, 188, 57, 255);
+		case 3: return IM_COL32(91, 224, 113, 255);
+		case 4: return IM_COL32(240, 76, 177, 255);
+		case 5: return Lighten(ThemeBaseColor(5), 0.48f);
+		default: return IM_COL32(79, 211, 255, 255);
+		}
+	}
+
+	ImU32 ContrastingTextColor(ImU32 color)
+	{
+		const int red = color & 0xFF;
+		const int green = (color >> 8) & 0xFF;
+		const int blue = (color >> 16) & 0xFF;
+		return red * 299 + green * 587 + blue * 114 > 154000 ?
+			IM_COL32(8, 14, 24, 255) : IM_COL32(255, 255, 255, 255);
+	}
+
+	void DrawGradientQuad(ImDrawList* draw, const ImVec2& point0, const ImVec2& point1,
+		const ImVec2& point2, const ImVec2& point3, ImU32 color0, ImU32 color1,
+		ImU32 color2, ImU32 color3)
+	{
+		const ImDrawIdx index = static_cast<ImDrawIdx>(draw->_VtxCurrentIdx);
+		const ImVec2 uv = ImGui::GetFontTexUvWhitePixel();
+		draw->PrimReserve(6, 4);
+		draw->PrimWriteIdx(index);
+		draw->PrimWriteIdx(static_cast<ImDrawIdx>(index + 1));
+		draw->PrimWriteIdx(static_cast<ImDrawIdx>(index + 2));
+		draw->PrimWriteIdx(index);
+		draw->PrimWriteIdx(static_cast<ImDrawIdx>(index + 2));
+		draw->PrimWriteIdx(static_cast<ImDrawIdx>(index + 3));
+		draw->PrimWriteVtx(point0, uv, color0);
+		draw->PrimWriteVtx(point1, uv, color1);
+		draw->PrimWriteVtx(point2, uv, color2);
+		draw->PrimWriteVtx(point3, uv, color3);
+	}
+
 	struct ThemePalette
 	{
 		ImU32 accent, secondary, background, surface, selectedSurface, text, muted, border;
@@ -313,23 +481,34 @@ namespace
 	ThemePalette CurrentTheme()
 	{
 		ThemePalette theme{};
-		switch (std::clamp<sint32>(GetConfig().emulated_usb_devices.skylander_theme.GetValue(), 0, 4))
+		switch (std::clamp<sint32>(GetConfig().emulated_usb_devices.skylander_theme.GetValue(), 0, 5))
 		{
-		case 1: theme = {IM_COL32(177, 105, 255, 255), IM_COL32(91, 216, 255, 255), IM_COL32(8, 5, 24, 255), IM_COL32(25, 16, 48, 255), IM_COL32(53, 29, 82, 255), IM_COL32(249, 244, 255, 255), IM_COL32(185, 164, 211, 255), IM_COL32(169, 125, 213, 255)}; break;
-		case 2: theme = {IM_COL32(255, 185, 60, 255), IM_COL32(255, 91, 54, 255), IM_COL32(24, 8, 4, 255), IM_COL32(53, 22, 10, 255), IM_COL32(89, 38, 14, 255), IM_COL32(255, 248, 231, 255), IM_COL32(218, 176, 132, 255), IM_COL32(224, 137, 66, 255)}; break;
-		case 3: theme = {IM_COL32(91, 231, 151, 255), IM_COL32(71, 207, 255, 255), IM_COL32(3, 19, 19, 255), IM_COL32(9, 43, 39, 255), IM_COL32(17, 70, 57, 255), IM_COL32(238, 255, 249, 255), IM_COL32(145, 204, 184, 255), IM_COL32(103, 193, 166, 255)}; break;
-		case 4: theme = {IM_COL32(244, 99, 170, 255), IM_COL32(177, 105, 255, 255), IM_COL32(20, 5, 20, 255), IM_COL32(48, 13, 42, 255), IM_COL32(80, 22, 67, 255), IM_COL32(255, 241, 251, 255), IM_COL32(215, 157, 197, 255), IM_COL32(211, 105, 174, 255)}; break;
-		default: theme = {IM_COL32(91, 216, 255, 255), IM_COL32(174, 119, 255, 255), IM_COL32(4, 7, 24, 255), IM_COL32(12, 20, 49, 255), IM_COL32(24, 59, 85, 255), IM_COL32(244, 249, 253, 255), IM_COL32(142, 177, 201, 255), IM_COL32(126, 165, 192, 255)}; break;
-		}
-		switch (std::clamp<sint32>(GetConfig().emulated_usb_devices.skylander_accent.GetValue(), 0, 5))
+		case 1: theme = {IM_COL32(174, 91, 255, 255), IM_COL32(69, 213, 255, 255), IM_COL32(31, 17, 52, 255), IM_COL32(54, 31, 80, 255), IM_COL32(91, 50, 130, 255), IM_COL32(250, 246, 255, 255), IM_COL32(210, 181, 232, 255), IM_COL32(143, 91, 190, 255)}; break;
+		case 2: theme = {IM_COL32(255, 188, 57, 255), IM_COL32(238, 64, 74, 255), IM_COL32(47, 22, 36, 255), IM_COL32(78, 37, 50, 255), IM_COL32(119, 52, 59, 255), IM_COL32(255, 247, 226, 255), IM_COL32(247, 190, 143, 255), IM_COL32(219, 91, 72, 255)}; break;
+		case 3: theme = {IM_COL32(91, 224, 113, 255), IM_COL32(52, 205, 230, 255), IM_COL32(16, 48, 43, 255), IM_COL32(28, 75, 60, 255), IM_COL32(45, 113, 76, 255), IM_COL32(245, 255, 235, 255), IM_COL32(177, 226, 183, 255), IM_COL32(69, 165, 102, 255)}; break;
+		case 4: theme = {IM_COL32(240, 76, 177, 255), IM_COL32(145, 91, 255, 255), IM_COL32(43, 21, 61, 255), IM_COL32(73, 35, 88, 255), IM_COL32(114, 53, 123, 255), IM_COL32(255, 242, 252, 255), IM_COL32(231, 176, 220, 255), IM_COL32(174, 85, 170, 255)}; break;
+		case 5:
 		{
-		case 1: theme.accent = IM_COL32(71, 207, 255, 255); break;
-		case 2: theme.accent = IM_COL32(177, 105, 255, 255); break;
-		case 3: theme.accent = IM_COL32(255, 190, 58, 255); break;
-		case 4: theme.accent = IM_COL32(91, 231, 151, 255); break;
-		case 5: theme.accent = IM_COL32(255, 92, 78, 255); break;
-		default: break;
+			const ImU32 base = ThemeBaseColor(5);
+			std::array<float, 3> hsv{};
+			ColorToHsv(base, hsv);
+			const ImU32 secondary = HsvColor(std::fmod(hsv[0] + 0.10f, 1.0f),
+				std::clamp(hsv[1] * 0.82f + 0.12f, 0.0f, 1.0f),
+				std::clamp(hsv[2] * 1.18f + 0.08f, 0.0f, 1.0f));
+			theme = {
+				Lighten(base, 0.48f), secondary,
+				BlendColor(base, IM_COL32(3, 7, 13, 255), 0.78f),
+				BlendColor(base, IM_COL32(5, 10, 18, 255), 0.52f),
+				base,
+				BlendColor(IM_COL32(255, 255, 255, 255), base, 0.06f),
+				Lighten(base, 0.58f), Lighten(base, 0.24f)};
+			break;
 		}
+		default: theme = {IM_COL32(79, 211, 255, 255), IM_COL32(239, 64, 75, 255), IM_COL32(16, 43, 70, 255), IM_COL32(28, 70, 101, 255), IM_COL32(47, 124, 160, 255), IM_COL32(250, 247, 230, 255), IM_COL32(174, 216, 232, 255), IM_COL32(62, 158, 199, 255)}; break;
+		}
+		const int themeIndex = std::clamp<sint32>(GetConfig().emulated_usb_devices.skylander_theme.GetValue(), 0, 5);
+		const int accentIndex = std::clamp<sint32>(GetConfig().emulated_usb_devices.skylander_accent.GetValue(), 0, 6);
+		theme.accent = ThemeAccentColor(themeIndex, accentIndex);
 		static ThemePalette displayed = theme;
 		static int blendedFrame = -1;
 		const int frame = ImGui::GetFrameCount();
@@ -821,26 +1000,14 @@ namespace
 			text.data(), text.data() + text.size());
 	}
 
-	void DrawShadowedText(ImDrawList* draw, ImVec2 position, ImU32 color, float size,
-		std::string_view text, float scale)
+	void DrawTitleText(ImDrawList* draw, const RiftLayout& layout, ImVec2 position, float size,
+		std::string_view text, float accentMix = 0.14f)
 	{
-		const float alpha = static_cast<float>((color >> 24) & 0xFF) / 255.0f;
-		DrawText(draw, {position.x + 4.0f * scale, position.y + 5.0f * scale},
-			WithAlpha(IM_COL32(0, 2, 10, 255), alpha * 0.30f), size, text);
-		DrawText(draw, {position.x + 2.0f * scale, position.y + 3.0f * scale},
-			WithAlpha(IM_COL32(0, 2, 10, 255), alpha * 0.72f), size, text);
-		DrawText(draw, position, color, size, text);
-	}
-
-	void DrawShadowedTextRightAligned(ImDrawList* draw, ImVec2 right, ImU32 color, float size,
-		std::string_view text, float scale)
-	{
-		const float alpha = static_cast<float>((color >> 24) & 0xFF) / 255.0f;
-		DrawTextRightAligned(draw, {right.x + 4.0f * scale, right.y + 5.0f * scale},
-			WithAlpha(IM_COL32(0, 2, 10, 255), alpha * 0.30f), size, text);
-		DrawTextRightAligned(draw, {right.x + 2.0f * scale, right.y + 3.0f * scale},
-			WithAlpha(IM_COL32(0, 2, 10, 255), alpha * 0.72f), size, text);
-		DrawTextRightAligned(draw, right, color, size, text);
+		const auto theme = CurrentTheme();
+		DrawText(draw, {position.x + DrawerWidth(layout, 1.5f), position.y + 2.0f * layout.scale},
+			WithAlpha(IM_COL32(0, 2, 10, 255), layout.alpha * 0.58f), size, text);
+		DrawText(draw, position, WithAlpha(BlendColor(theme.text, theme.accent, accentMix), layout.alpha),
+			size, text);
 	}
 
 	void DrawGlow(ImDrawList* draw, ImVec2 center, float radius, ImU32 color, float alpha)
@@ -848,15 +1015,17 @@ namespace
 		const int bloom = BloomLevel();
 		if (bloom == 0 || alpha <= 0.0f)
 			return;
-		const float strength = bloom == 2 ? 1.45f : 1.0f;
-		const int ringCount = bloom == 2 ? 3 : 2;
-		const int segments = bloom == 2 ? 32 : 24;
+		const float strength = bloom == 2 ? 1.08f : 0.88f;
+		const int ringCount = bloom == 2 ? 12 : 8;
+		const int segments = bloom == 2 ? 80 : 64;
 		for (int ring = ringCount; ring >= 1; --ring)
 		{
 			const float fraction = static_cast<float>(ring) / ringCount;
-			draw->AddCircleFilled(center, radius * (0.70f + fraction * 0.30f) *
-				(bloom == 2 ? 1.08f : 1.0f),
-				WithAlpha(color, alpha * strength * (0.045f + (1.0f - fraction) * 0.15f)), segments);
+			const float falloff = 1.0f - fraction;
+			const float radiusScale = (0.42f + fraction * 0.68f) * (bloom == 2 ? 1.05f : 1.0f);
+			const float layerOpacity = 0.006f + falloff * falloff * 0.019f;
+			draw->AddCircleFilled(center, radius * radiusScale,
+				WithAlpha(color, alpha * strength * layerOpacity), segments);
 		}
 	}
 
@@ -865,19 +1034,22 @@ namespace
 		if (intensity < 0.01f || BloomLevel() == 0)
 			return;
 		const float time = static_cast<float>(ImGui::GetTime());
-		const float pulse = MotionLevel() == 2 ? 0.5f + 0.5f * std::sin(time * 3.1f) : 0.5f;
+		const float pulse = AmbientMotionEnabled() ?
+			0.5f + 0.5f * std::sin(time * 1.25f * AmbientTempo()) : 0.5f;
 		draw->AddCircle(center, radius * (0.90f + pulse * 0.07f),
-			WithAlpha(color, alpha * intensity * (0.18f + pulse * 0.12f)), 32,
+			WithAlpha(color, alpha * intensity * (0.12f + pulse * 0.08f)), 48,
 			(1.0f + pulse * 0.8f) * intensity);
 		const int particles = std::clamp<sint32>(
 			GetConfig().emulated_usb_devices.skylander_particle_level.GetValue(), 0, 3);
-		if (MotionLevel() != 2 || particles == 0)
+		if (!AmbientMotionEnabled() || particles == 0)
 			return;
 		const int sparkCount = particles == 1 ? 3 : particles == 2 ? 5 : 8;
 		for (int spark = 0; spark < sparkCount; ++spark)
 		{
-			const float angle = time * (0.48f + spark * 0.025f) + spark * (2.0f * kPi / sparkCount);
-			const float orbit = radius * (0.78f + 0.10f * std::sin(time * 1.7f + spark));
+			const float angle = time * (0.24f + spark * 0.014f) * AmbientTempo() +
+				spark * (2.0f * kPi / sparkCount);
+			const float orbit = radius * (0.78f + 0.10f *
+				std::sin(time * 0.82f * AmbientTempo() + spark));
 			const ImVec2 position{center.x + std::cos(angle) * orbit, center.y + std::sin(angle) * orbit};
 			draw->AddCircleFilled(position, (1.6f + (spark % 3) * 0.7f) * intensity,
 				WithAlpha(color, alpha * intensity * (0.34f + pulse * 0.26f)), 8);
@@ -898,7 +1070,7 @@ namespace
 		}
 		const float opacity = std::clamp<sint32>(
 			GetConfig().emulated_usb_devices.skylander_drawer_opacity.GetValue(), 0, 100) / 100.0f;
-		const float surfaceAlpha = (strong ? 0.78f : 0.64f) * (0.45f + opacity * 0.55f);
+		const float surfaceAlpha = (strong ? 0.82f : 0.68f) * (0.16f + opacity * 0.84f);
 		draw->AddRectFilled(minimum, maximum,
 			WithAlpha(strong ? theme.surface : Lighten(theme.surface, 0.06f),
 				layout.alpha * surfaceAlpha), radius);
@@ -934,6 +1106,48 @@ namespace
 			radius, 0, (active ? 1.5f : 1.0f) * layout.scale);
 	}
 
+	void DrawAnimatedControlSurface(ImDrawList* draw, const RiftLayout& layout, ImVec2 minimum, ImVec2 maximum,
+		float focus, bool active, ImU32 accent)
+	{
+		const auto theme = CurrentTheme();
+		focus = Clamp01(focus);
+		const float emphasis = std::max(focus, active ? 0.34f : 0.0f);
+		const float radius = CornerRadius(5.0f) * layout.scale;
+		if (focus > 0.01f)
+		{
+			draw->AddRectFilled({minimum.x + DrawerWidth(layout, 4.0f), minimum.y + 6.0f * layout.scale},
+				{maximum.x + DrawerWidth(layout, 4.0f), maximum.y + 6.0f * layout.scale},
+				WithAlpha(IM_COL32(0, 2, 10, 255), layout.alpha * focus * 0.30f), radius);
+		}
+		const ImU32 restingSurface = active ? BlendColor(theme.surface, accent, 0.10f) : theme.surface;
+		const ImU32 fill = BlendColor(restingSurface, theme.selectedSurface, focus * 0.82f);
+		draw->AddRectFilled(minimum, maximum,
+			WithAlpha(fill, layout.alpha * (0.56f + emphasis * 0.30f)), radius);
+		draw->AddRect(minimum, maximum,
+			WithAlpha(emphasis > 0.0f ? accent : theme.border,
+				layout.alpha * (0.24f + emphasis * 0.60f)),
+			radius, 0, (1.0f + focus * 0.7f) * layout.scale);
+	}
+
+	void DrawSettingsChoiceSurface(ImDrawList* draw, const RiftLayout& layout, ImVec2 minimum,
+		ImVec2 maximum, float focus)
+	{
+		const auto theme = CurrentTheme();
+		focus = Clamp01(focus);
+		const float radius = CornerRadius(4.0f) * layout.scale;
+		if (focus > 0.01f)
+			draw->AddRectFilled({minimum.x + 3.0f * layout.scale, minimum.y + 4.0f * layout.scale},
+				{maximum.x + 3.0f * layout.scale, maximum.y + 4.0f * layout.scale},
+				WithAlpha(IM_COL32(0, 2, 10, 255), layout.alpha * focus * 0.28f), radius);
+		const ImU32 fill = BlendColor(theme.surface, theme.selectedSurface, focus * 0.34f);
+		draw->AddRectFilled(minimum, maximum,
+			WithAlpha(fill, layout.alpha * (0.52f + focus * 0.18f)), radius);
+		draw->AddRect(minimum, maximum,
+			WithAlpha(BlendColor(theme.border, theme.accent, focus),
+				layout.alpha * (0.20f + focus * 0.56f)), radius, 0,
+			(1.0f + focus * 0.8f) * layout.scale);
+	}
+
 	struct CardGeometry
 	{
 		ImVec2 p0{};
@@ -956,6 +1170,52 @@ namespace
 			rotate(-width * 0.5f, height * 0.5f)};
 	}
 
+	void RotateDrawVertices(ImDrawList* draw, int firstVertex, ImVec2 center, float rotation)
+	{
+		if (std::abs(rotation) <= 0.0001f)
+			return;
+		const float cosine = std::cos(rotation);
+		const float sine = std::sin(rotation);
+		for (int index = firstVertex; index < draw->VtxBuffer.Size; ++index)
+		{
+			auto& position = draw->VtxBuffer[index].pos;
+			const float x = position.x - center.x;
+			const float y = position.y - center.y;
+			position = {center.x + x * cosine - y * sine, center.y + x * sine + y * cosine};
+		}
+	}
+
+	void DrawRoundedCardFill(ImDrawList* draw, ImVec2 center, float width, float height,
+		float rotation, ImU32 color, float rounding)
+	{
+		const ImVec2 minimum{center.x - width * 0.5f, center.y - height * 0.5f};
+		const ImVec2 maximum{center.x + width * 0.5f, center.y + height * 0.5f};
+		const int firstVertex = draw->VtxBuffer.Size;
+		draw->AddRectFilled(minimum, maximum, color, rounding);
+		RotateDrawVertices(draw, firstVertex, center, rotation);
+	}
+
+	void DrawRoundedCardOutline(ImDrawList* draw, ImVec2 center, float width, float height,
+		float rotation, ImU32 color, float rounding, float thickness)
+	{
+		const ImVec2 minimum{center.x - width * 0.5f, center.y - height * 0.5f};
+		const ImVec2 maximum{center.x + width * 0.5f, center.y + height * 0.5f};
+		const int firstVertex = draw->VtxBuffer.Size;
+		draw->AddRect(minimum, maximum, color, rounding, 0, thickness);
+		RotateDrawVertices(draw, firstVertex, center, rotation);
+	}
+
+	void DrawRoundedCardImage(ImDrawList* draw, const ArtworkTexture& texture, ImVec2 center,
+		float width, float height, float rotation, ImU32 color, float rounding)
+	{
+		const ImVec2 minimum{center.x - width * 0.5f, center.y - height * 0.5f};
+		const ImVec2 maximum{center.x + width * 0.5f, center.y + height * 0.5f};
+		const int firstVertex = draw->VtxBuffer.Size;
+		draw->AddImageRounded(texture.id, minimum, maximum, texture.uvMinimum, texture.uvMaximum,
+			color, rounding);
+		RotateDrawVertices(draw, firstVertex, center, rotation);
+	}
+
 	void DrawCard(ImDrawList* draw, const ArtworkTexture& texture, ImVec2 center, float height,
 		float rotation, float focus, float alpha)
 	{
@@ -963,44 +1223,64 @@ namespace
 		const float aspect = texture.id && texture.size.y > 0.0f ? texture.size.x / texture.size.y : 0.64f;
 		const float width = height * aspect;
 		const auto card = MakeCardQuad(center, width, height, rotation);
+		const float rounding = CornerRadius(std::min(width, height) * 0.045f);
 		const ImU32 accent = texture.id ? texture.accent : CurrentTheme().accent;
-		const int effect = std::clamp<sint32>(GetConfig().emulated_usb_devices.skylander_card_effect.GetValue(), 0, 3);
-		const int borderStyle = std::clamp<sint32>(GetConfig().emulated_usb_devices.skylander_card_border.GetValue(), 0, 3);
+		const int effect = CardEffect();
+		const int borderStyle = std::clamp<sint32>(GetConfig().emulated_usb_devices.skylander_card_border.GetValue(), 0, 1);
 		for (int layer = 6; layer >= 1; --layer)
 		{
 			const float offsetX = 1.0f + layer * 0.85f;
 			const float offsetY = 2.0f + layer * 1.1f;
-			draw->AddQuadFilled(
-				{card.p0.x + offsetX, card.p0.y + offsetY}, {card.p1.x + offsetX, card.p1.y + offsetY},
-				{card.p2.x + offsetX, card.p2.y + offsetY}, {card.p3.x + offsetX, card.p3.y + offsetY},
-				WithAlpha(IM_COL32(0, 0, 0, 255), alpha * (0.020f + focus * 0.018f)));
+			DrawRoundedCardFill(draw, {center.x + offsetX, center.y + offsetY}, width, height,
+				rotation, WithAlpha(IM_COL32(0, 0, 0, 255), alpha * (0.034f + focus * 0.022f)), rounding);
 		}
 		if (focus > 0.001f && effect >= 1)
 		{
-			const int outer = effect >= 2 ? 14 : 8;
-			for (int outline = outer; outline >= 2; outline -= 2)
-				draw->AddQuad(card.p0, card.p1, card.p2, card.p3,
-					WithAlpha(accent, alpha * focus * (0.018f + (outer - outline) * 0.006f)), outline + 2.0f);
+			const int outer = effect == 1 ? 18 : 14;
+			const float bloomStrength = BloomLevel() == 0 ? 0.72f : BloomLevel() == 2 ? 1.22f : 1.0f;
+			for (int outline = outer; outline >= 3; outline -= 3)
+			{
+				const float closeness = 1.0f - static_cast<float>(outline) / outer;
+				DrawRoundedCardOutline(draw, center, width, height, rotation,
+					WithAlpha(accent, alpha * focus * bloomStrength * (0.032f + closeness * 0.080f)),
+					rounding, static_cast<float>(outline));
+			}
 		}
 		if (texture.state == ArtworkTexture::State::Ready && texture.id)
 		{
-			draw->AddImageQuad(texture.id, card.p0, card.p1, card.p2, card.p3,
-				texture.uvMinimum, {texture.uvMaximum.x, texture.uvMinimum.y},
-				texture.uvMaximum, {texture.uvMinimum.x, texture.uvMaximum.y},
-				WithAlpha(IM_COL32_WHITE, alpha));
+			DrawRoundedCardImage(draw, texture, center, width, height, rotation,
+				WithAlpha(IM_COL32_WHITE, alpha), rounding);
 			if (focus > 0.001f && effect == 3)
 			{
-				const float shimmer = 0.5f + 0.5f * std::sin(static_cast<float>(ImGui::GetTime()) * 1.7f);
-				const ImVec2 a{card.p0.x + (card.p1.x - card.p0.x) * shimmer, card.p0.y + (card.p1.y - card.p0.y) * shimmer};
-				const ImVec2 b{card.p3.x + (card.p2.x - card.p3.x) * shimmer, card.p3.y + (card.p2.y - card.p3.y) * shimmer};
-				draw->AddLine(a, b, WithAlpha(IM_COL32_WHITE, alpha * focus * 0.10f), std::max(1.0f, height * 0.025f));
+				const float sweep = std::fmod(static_cast<float>(ImGui::GetTime()) * 0.085f, 1.5f) - 0.25f;
+				auto edgePoint = [](ImVec2 from, ImVec2 to, float amount) {
+					amount = Clamp01(amount);
+					return ImVec2{from.x + (to.x - from.x) * amount, from.y + (to.y - from.y) * amount};
+				};
+				for (int layer = -4; layer <= 4; ++layer)
+				{
+					const float offset = layer * 0.020f;
+					const float top = sweep + offset;
+					const float bottom = sweep - 0.18f + offset;
+					if (top < -0.04f && bottom < -0.04f || top > 1.04f && bottom > 1.04f)
+						continue;
+					const float halfWidth = 0.018f;
+					const float intensity = 1.0f - std::abs(static_cast<float>(layer)) / 5.0f;
+					const ImU32 sheen = BlendColor(accent, IM_COL32_WHITE, 0.66f + intensity * 0.22f);
+					draw->AddQuadFilled(
+						edgePoint(card.p0, card.p1, top - halfWidth),
+						edgePoint(card.p0, card.p1, top + halfWidth),
+						edgePoint(card.p3, card.p2, bottom + halfWidth),
+						edgePoint(card.p3, card.p2, bottom - halfWidth),
+						WithAlpha(sheen, alpha * focus * (0.012f + intensity * 0.032f)));
+				}
 			}
 		}
 		else
 		{
-			draw->AddQuadFilled(card.p0, card.p1, card.p2, card.p3,
+			DrawRoundedCardFill(draw, center, width, height, rotation,
 				WithAlpha(texture.state == ArtworkTexture::State::Loading ?
-					IM_COL32(18, 43, 64, 255) : IM_COL32(24, 32, 49, 255), alpha));
+					IM_COL32(18, 43, 64, 255) : IM_COL32(24, 32, 49, 255), alpha), rounding);
 			const bool loading = texture.state == ArtworkTexture::State::Loading;
 			DrawTextCentered(draw, {center.x, center.y - height * 0.035f},
 				WithAlpha(IM_COL32(166, 207, 230, 255), alpha * 0.82f),
@@ -1010,40 +1290,19 @@ namespace
 					WithAlpha(IM_COL32(124, 158, 181, 255), alpha * 0.70f),
 					std::max(8.0f, height * 0.042f), "NO ART");
 		}
-		const ImU32 borderColor = BlendColor(borderStyle == 0 ? IM_COL32(164, 190, 213, 255) : accent,
-			Lighten(accent, 0.25f), focus);
-		if (borderStyle >= 2)
-			draw->AddQuad(card.p0, card.p1, card.p2, card.p3,
-				WithAlpha(IM_COL32(3, 7, 14, 255), alpha * 0.86f), 4.0f + focus * 1.5f);
-		const float restingOpacity = borderStyle == 0 ? 0.30f : 0.62f;
-		const float restingWidth = borderStyle >= 2 ? 2.0f : 1.35f;
-		draw->AddQuad(card.p0, card.p1, card.p2, card.p3,
-			WithAlpha(borderColor, alpha * (restingOpacity + (0.96f - restingOpacity) * focus)),
-			restingWidth + (3.0f - restingWidth) * focus);
-		if (borderStyle == 3)
-		{
-			constexpr float cornerLength = 0.16f;
-			auto edgePoint = [](ImVec2 from, ImVec2 to, float t) {
-				return ImVec2{from.x + (to.x - from.x) * t, from.y + (to.y - from.y) * t};
-			};
-			const ImU32 runeColor = WithAlpha(Lighten(accent, 0.36f), alpha * 0.95f);
-			draw->AddLine(card.p0, edgePoint(card.p0, card.p1, cornerLength), runeColor, 3.0f);
-			draw->AddLine(card.p0, edgePoint(card.p0, card.p3, cornerLength), runeColor, 3.0f);
-			draw->AddLine(card.p2, edgePoint(card.p2, card.p1, cornerLength), runeColor, 3.0f);
-			draw->AddLine(card.p2, edgePoint(card.p2, card.p3, cornerLength), runeColor, 3.0f);
-		}
+		const ImU32 borderColor = BlendColor(borderStyle == 0 ? CurrentTheme().border : accent,
+			Lighten(accent, 0.18f), focus);
+		const float restingOpacity = borderStyle == 0 ? 0.22f : 0.38f;
+		const float restingWidth = borderStyle == 0 ? 1.0f : 1.25f;
+		DrawRoundedCardOutline(draw, center, width, height, rotation,
+			WithAlpha(borderColor, alpha * (restingOpacity + (0.82f - restingOpacity) * focus)),
+			rounding, restingWidth + (2.0f - restingWidth) * focus);
 	}
 
-	void DrawStar(ImDrawList* draw, ImVec2 center, float radius, ImU32 color)
+	void DrawFavoriteIcon(ImDrawList* draw, ImVec2 center, float size, ImU32 color)
 	{
-		std::array<ImVec2, 10> points{};
-		for (int i = 0; i < 10; ++i)
-		{
-			const float angle = -kPi * 0.5f + i * kPi / 5.0f;
-			const float r = i % 2 ? radius * 0.44f : radius;
-			points[i] = {center.x + std::cos(angle) * r, center.y + std::sin(angle) * r};
-		}
-		draw->AddConvexPolyFilled(points.data(), static_cast<int>(points.size()), color);
+		DrawTextCentered(draw, center, color, size,
+			reinterpret_cast<const char*>(ICON_FA_BOOKMARK));
 	}
 
 	void SetToast(std::string value, float seconds = 2.2f)
@@ -1054,6 +1313,11 @@ namespace
 
 	void SetMenuOpen(bool open, bool pulse = true)
 	{
+		if (!open && s_menu.page == RiftPage::ColorEditor && s_menu.colorEditorDirty)
+		{
+			g_config.Save();
+			s_menu.colorEditorDirty = false;
+		}
 		if (s_menu.requestedOpen == open)
 			return;
 		s_menu.requestedOpen = open;
@@ -1061,7 +1325,12 @@ namespace
 		if (open)
 		{
 			s_menu.page = RiftPage::Dashboard;
-			s_menu.focus = FocusArea::Library;
+			const auto loaded = nsyshid::g_skyportal.GetLoadedSkylanders();
+			const bool portalOccupied = std::any_of(loaded.begin(), loaded.end(),
+				[](const auto& figure) { return figure.has_value(); });
+			s_menu.focus = portalOccupied ? FocusArea::Portal : FocusArea::Library;
+			if (portalOccupied)
+				s_menu.selectedPortalRow = 0;
 			s_menu.selectedElementFilter = std::clamp<sint32>(
 				GetConfig().emulated_usb_devices.skylander_element_filter.GetValue(), 0, 11);
 			s_menu.portalModeFlash = MotionEnabled() ? 0.72f : 0.0f;
@@ -1072,6 +1341,7 @@ namespace
 		else
 		{
 			s_menu.searchTarget = SearchTarget::None;
+			s_textInputTarget.store(0, std::memory_order_release);
 			s_menu.reloadCatalog = true;
 		}
 		if (pulse)
@@ -1106,28 +1376,55 @@ namespace
 		s_menu.detailsWasDown = false;
 		s_menu.sortWasDown = false;
 		s_menu.favoriteWasDown = false;
+		s_menu.startWasDown = false;
+		s_menu.mouseNavigationActive = true;
+		s_menu.mousePositionInitialized = false;
 		s_menu.ownerController = -1;
 		s_menu.nextNavigationRepeat.fill(0.0);
+		s_textInputTarget.store(0, std::memory_order_release);
+		{
+			const std::lock_guard lock(s_textInputMutex);
+			s_textInputQueue.clear();
+		}
 		EmulatedController::SetRiftInputCaptured(false);
 	}
 
-	void SetPortalMode(bool virtualPortal)
+	int PortalMode()
 	{
+		return std::clamp(GetConfig().emulated_usb_devices.skylander_portal_mode.GetValue(), 0, 2);
+	}
+
+	bool VirtualPortalAvailable()
+	{
+		return PortalMode() != 1;
+	}
+
+	constexpr int HeaderItemCount()
+	{
+		return 5;
+	}
+
+	void SetPortalMode(int mode)
+	{
+		mode = std::clamp(mode, 0, 2);
 		auto& config = GetConfig().emulated_usb_devices;
-		const bool alreadyActive = config.emulate_skylander_portal.GetValue() == virtualPortal &&
-			config.skylander_portal_mode.GetValue() == (virtualPortal ? 0 : 1);
-		s_menu.headerSelection = virtualPortal ? 0 : 1;
+		const bool alreadyActive = PortalMode() == mode;
+		s_menu.headerSelection = mode;
 		if (alreadyActive)
 		{
-			SetToast(virtualPortal ? "VIRTUAL PORTAL IS ALREADY ACTIVE" : "PHYSICAL PORTAL IS ALREADY ACTIVE", 1.8f);
+			static constexpr std::array<std::string_view, 3> names{
+				"VIRTUAL PORTAL", "PHYSICAL PORTAL", "HYBRID PORTAL"};
+			SetToast(std::string(names[mode]) + " IS ALREADY ACTIVE", 1.8f);
 			return;
 		}
-		config.emulate_skylander_portal = virtualPortal;
-		config.skylander_portal_mode = virtualPortal ? 0 : 1;
+		config.emulate_skylander_portal = mode != 1;
+		config.skylander_portal_mode = mode;
 		g_config.Save();
-		nsyshid::backend::SetSkylanderPortalEmulation(virtualPortal);
+		nsyshid::backend::SetSkylanderPortalMode(mode);
 		s_menu.portalModeFlash = 1.0f;
-		SetToast(virtualPortal ? "VIRTUAL PORTAL ACTIVE" : "PHYSICAL PORTAL ACTIVE", 2.4f);
+		static constexpr std::array<std::string_view, 3> names{
+			"VIRTUAL PORTAL ACTIVE", "PHYSICAL PORTAL ACTIVE", "HYBRID PORTAL ACTIVE"};
+		SetToast(std::string(names[mode]), 2.4f);
 	}
 
 	std::string SafeFileName(std::string value)
@@ -1173,6 +1470,82 @@ namespace
 		return Lowercase(_pathToUtf8(path.lexically_normal()));
 	}
 
+	fs::path LabelFilePath()
+	{
+		const std::string configured = GetConfig().emulated_usb_devices.skylander_collection_path.GetValue();
+		return configured.empty() ? fs::path{} : _utf8ToPath(configured) / ".rift-labels.json";
+	}
+
+	std::string LabelKey(const fs::path& path)
+	{
+		const std::string configured = GetConfig().emulated_usb_devices.skylander_collection_path.GetValue();
+		if (configured.empty())
+			return FavoriteKey(path);
+		std::error_code error;
+		const fs::path relative = fs::relative(path.lexically_normal(), _utf8ToPath(configured).lexically_normal(), error);
+		bool valid = !error && !relative.empty() && !relative.is_absolute();
+		for (const auto& part : relative)
+			valid = valid && part != "..";
+		return valid ? Lowercase(_pathToUtf8(relative)) : FavoriteKey(path);
+	}
+
+	void LoadLabels()
+	{
+		s_menu.labels.clear();
+		const fs::path path = LabelFilePath();
+		if (path.empty())
+			return;
+		auto data = FileStream::LoadIntoMemory(path);
+		if (!data)
+			return;
+		rapidjson::Document document;
+		document.Parse(reinterpret_cast<const char*>(data->data()), data->size());
+		if (document.HasParseError() || !document.IsObject())
+			return;
+		const auto labels = document.FindMember("labels");
+		if (labels == document.MemberEnd() || !labels->value.IsObject())
+			return;
+		for (auto entry = labels->value.MemberBegin(); entry != labels->value.MemberEnd(); ++entry)
+		{
+			if (!entry->value.IsString() || entry->name.GetStringLength() == 0 ||
+				entry->value.GetStringLength() == 0 || entry->value.GetStringLength() >= s_menu.labelText.size())
+				continue;
+			s_menu.labels.emplace(Lowercase(entry->name.GetString()), entry->value.GetString());
+		}
+	}
+
+	bool SaveLabels()
+	{
+		const fs::path path = LabelFilePath();
+		if (path.empty())
+			return false;
+		std::vector<std::pair<std::string, std::string>> labels(s_menu.labels.begin(), s_menu.labels.end());
+		std::sort(labels.begin(), labels.end());
+		rapidjson::StringBuffer buffer;
+		rapidjson::PrettyWriter<rapidjson::StringBuffer> writer(buffer);
+		writer.StartObject();
+		writer.Key("version");
+		writer.Int(1);
+		writer.Key("labels");
+		writer.StartObject();
+		for (const auto& [key, value] : labels)
+		{
+			writer.Key(key.data(), static_cast<rapidjson::SizeType>(key.size()));
+			writer.String(value.data(), static_cast<rapidjson::SizeType>(value.size()));
+		}
+		writer.EndObject();
+		writer.EndObject();
+		std::unique_ptr<FileStream> file(FileStream::createFile2(path));
+		return file && file->writeData(buffer.GetString(), static_cast<sint32>(buffer.GetSize())) ==
+			static_cast<sint32>(buffer.GetSize());
+	}
+
+	std::string FigureLabel(const fs::path& path)
+	{
+		const auto label = s_menu.labels.find(LabelKey(path));
+		return label == s_menu.labels.end() ? std::string{} : label->second;
+	}
+
 	void LoadPreferences()
 	{
 		s_menu.favorites.clear();
@@ -1192,6 +1565,7 @@ namespace
 		const sint32 sort = GetConfig().emulated_usb_devices.skylander_sort_mode.GetValue();
 		if (sort < 0 || sort >= static_cast<sint32>(SortMode::Count))
 			GetConfig().emulated_usb_devices.skylander_sort_mode = 0;
+		LoadLabels();
 	}
 
 	bool IsFavorite(const fs::path& path)
@@ -1369,6 +1743,8 @@ namespace
 		s_menu.library.clear();
 		s_cardCarouselOffsets.clear();
 		s_cardFocusAmounts.clear();
+		s_cascadeCardOffsets.clear();
+		s_cascadeCardFocusAmounts.clear();
 		for (const auto& figure : s_menu.catalog.GetCollection())
 		{
 			if (CurrentSortMode() == SortMode::FavoritesOnly && !IsFavorite(figure.filePath))
@@ -1386,7 +1762,8 @@ namespace
 				GetConfig().emulated_usb_devices.skylander_element_filter.GetValue(), 0, 11);
 			if (elementFilter != 0 && figure.element != ElementForChoice(elementFilter))
 				continue;
-			const std::string haystack = Lowercase(figure.name + " " + _pathToUtf8(figure.filePath.filename()));
+			const std::string haystack = Lowercase(figure.name + " " + FigureLabel(figure.filePath) + " " +
+				_pathToUtf8(figure.filePath.filename()));
 			if (!query.empty() && haystack.find(query) == std::string::npos)
 				continue;
 			s_menu.library.push_back(figure);
@@ -1504,6 +1881,7 @@ namespace
 			dashboardArtwork.emplace_back(glyphFolder / glyph);
 		QueueArtworkAtlas(dashboardArtwork);
 		s_menu.rebuildLibrary = false;
+		++s_libraryGeneration;
 	}
 
 	void ReloadCatalogIfNeeded()
@@ -1554,15 +1932,74 @@ namespace
 
 	std::vector<PortalRow> BuildPortalRows()
 	{
-		std::vector<PortalRow> rows;
+		std::vector<PortalRow> loadedRows;
 		const auto loaded = nsyshid::g_skyportal.GetLoadedSkylanders();
-		rows.reserve(kPortalCapacity);
+		loadedRows.reserve(kPortalCapacity);
 		for (int slot = 0; slot < static_cast<int>(loaded.size()); ++slot)
 		{
 			if (!loaded[slot])
 				continue;
 			const auto* definition = s_menu.catalog.Find(loaded[slot]->first, loaded[slot]->second);
-			rows.push_back({slot, loaded[slot]->first, loaded[slot]->second, definition, 0});
+			loadedRows.push_back({slot, loaded[slot]->first, loaded[slot]->second, definition, 0});
+		}
+
+		auto swapperKey = [](uint16 id) -> int {
+			if (id >= 1000 && id <= 1015)
+				return id;
+			if (id >= 2000 && id <= 2015)
+				return id - 1000;
+			return -1;
+		};
+		auto isTop = [](uint16 id) { return id >= 2000 && id <= 2015; };
+		std::vector<PortalRow> rows;
+		rows.reserve(kPortalCapacity);
+		std::vector<bool> placed(loadedRows.size(), false);
+		for (size_t index = 0; index < loadedRows.size(); ++index)
+		{
+			if (placed[index])
+				continue;
+			const int key = swapperKey(loadedRows[index].id);
+			if (key < 0)
+			{
+				rows.push_back(loadedRows[index]);
+				placed[index] = true;
+				continue;
+			}
+			size_t pairIndex = loadedRows.size();
+			for (size_t candidate = index + 1; candidate < loadedRows.size(); ++candidate)
+			{
+				if (!placed[candidate] && swapperKey(loadedRows[candidate].id) == key &&
+					isTop(loadedRows[candidate].id) != isTop(loadedRows[index].id) &&
+					loadedRows[candidate].variant == loadedRows[index].variant)
+				{
+					pairIndex = candidate;
+					break;
+				}
+			}
+			if (pairIndex == loadedRows.size())
+			{
+				for (size_t candidate = index + 1; candidate < loadedRows.size(); ++candidate)
+				{
+					if (!placed[candidate] && swapperKey(loadedRows[candidate].id) >= 0 &&
+						isTop(loadedRows[candidate].id) != isTop(loadedRows[index].id))
+					{
+						pairIndex = candidate;
+						break;
+					}
+				}
+			}
+			if (pairIndex == loadedRows.size())
+			{
+				rows.push_back(loadedRows[index]);
+				placed[index] = true;
+				continue;
+			}
+			const size_t topIndex = isTop(loadedRows[index].id) ? index : pairIndex;
+			const size_t bottomIndex = topIndex == index ? pairIndex : index;
+			rows.push_back(loadedRows[topIndex]);
+			rows.push_back(loadedRows[bottomIndex]);
+			placed[index] = true;
+			placed[pairIndex] = true;
 		}
 		if (rows.size() < kPortalCapacity)
 			rows.emplace_back();
@@ -1605,6 +2042,50 @@ namespace
 		}
 	}
 
+	std::string_view FigureGameName(skylander_ui::FigureGame game)
+	{
+		using skylander_ui::FigureGame;
+		switch (game)
+		{
+		case FigureGame::SpyrosAdventure: return "SPYRO'S ADVENTURE";
+		case FigureGame::Giants: return "GIANTS";
+		case FigureGame::SwapForce: return "SWAP FORCE";
+		case FigureGame::TrapTeam: return "TRAP TEAM";
+		case FigureGame::SuperChargers: return "SUPERCHARGERS";
+		case FigureGame::Imaginators: return "IMAGINATORS";
+		default: return "UNKNOWN";
+		}
+	}
+
+	std::string_view ForgeGameFilterName()
+	{
+		switch (s_menu.forgeGameFilter)
+		{
+		case 1: return "SSA";
+		case 2: return "GIANTS";
+		case 3: return "SWAP FORCE";
+		case 4: return "TRAP TEAM";
+		case 5: return "SUPERCHARGERS";
+		case 6: return "IMAGINATORS";
+		default: return "ALL";
+		}
+	}
+
+	int FigureGameRank(skylander_ui::FigureGame game)
+	{
+		using skylander_ui::FigureGame;
+		switch (game)
+		{
+		case FigureGame::SpyrosAdventure: return 0;
+		case FigureGame::Giants: return 1;
+		case FigureGame::SwapForce: return 2;
+		case FigureGame::TrapTeam: return 3;
+		case FigureGame::SuperChargers: return 4;
+		case FigureGame::Imaginators: return 5;
+		default: return 6;
+		}
+	}
+
 	std::string_view ForgeSortName()
 	{
 		switch (static_cast<ForgeSortMode>(s_menu.forgeSortMode))
@@ -1612,6 +2093,7 @@ namespace
 		case ForgeSortMode::NameDescending: return "NAME Z-A";
 		case ForgeSortMode::Element: return "ELEMENT";
 		case ForgeSortMode::FigureType: return "FIGURE TYPE";
+		case ForgeSortMode::Game: return "GAME";
 		default: return "NAME A-Z";
 		}
 	}
@@ -1655,8 +2137,12 @@ namespace
 				continue;
 			if (!MatchesForgeType(definition.type))
 				continue;
-			const std::string haystack = Lowercase(fmt::format("{} {} {} {:04X} {:04X}",
+			if (s_menu.forgeGameFilter != 0 &&
+				definition.game != static_cast<skylander_ui::FigureGame>(s_menu.forgeGameFilter))
+				continue;
+			const std::string haystack = Lowercase(fmt::format("{} {} {} {} {:04X} {:04X}",
 				definition.name, ElementName(definition.element), FigureTypeName(definition.type),
+				FigureGameName(definition.game),
 				definition.id, definition.variant));
 			if (!query.empty() && haystack.find(query) == std::string::npos)
 				continue;
@@ -1684,6 +2170,13 @@ namespace
 			std::sort(filtered.begin(), filtered.end(), [&](const auto* lhs, const auto* rhs) {
 				const auto left = std::tuple{FigureTypeRank(lhs->type), Lowercase(lhs->name), lhs->id, lhs->variant};
 				const auto right = std::tuple{FigureTypeRank(rhs->type), Lowercase(rhs->name), rhs->id, rhs->variant};
+				return left < right;
+			});
+			break;
+		case ForgeSortMode::Game:
+			std::sort(filtered.begin(), filtered.end(), [&](const auto* lhs, const auto* rhs) {
+				const auto left = std::tuple{FigureGameRank(lhs->game), Lowercase(lhs->name), lhs->id, lhs->variant};
+				const auto right = std::tuple{FigureGameRank(rhs->game), Lowercase(rhs->name), rhs->id, rhs->variant};
 				return left < right;
 			});
 			break;
@@ -1718,11 +2211,20 @@ namespace
 		PulseHaptics();
 	}
 
+	void CycleForgeGameFilter()
+	{
+		s_menu.forgeGameFilter = WrapChoice(s_menu.forgeGameFilter + 1, 7);
+		s_menu.selectedDefinition = 0;
+		SetToast("CREATE GAME: " + std::string(ForgeGameFilterName()), 1.5f);
+		PulseHaptics();
+	}
+
 	void ResetForgeFilters()
 	{
 		s_menu.forgeSearchText.fill(0);
 		s_menu.forgeTypeFilter = 0;
 		s_menu.forgeElementFilter = 0;
+		s_menu.forgeGameFilter = 0;
 		s_menu.selectedDefinition = 0;
 		SetToast("CREATE FILTERS CLEARED", 1.5f);
 		PulseHaptics();
@@ -1730,7 +2232,11 @@ namespace
 
 	std::array<char, 96>& ActiveSearchText()
 	{
-		return s_menu.searchTarget == SearchTarget::Create ? s_menu.forgeSearchText : s_menu.searchText;
+		if (s_menu.searchTarget == SearchTarget::Create)
+			return s_menu.forgeSearchText;
+		if (s_menu.searchTarget == SearchTarget::Label)
+			return s_menu.labelText;
+		return s_menu.searchText;
 	}
 
 	const std::array<std::string_view, 4>& KeyboardCharacterRows()
@@ -1749,31 +2255,89 @@ namespace
 	{
 		if (s_menu.searchTarget == SearchTarget::Collection)
 			RebuildLibrary();
-		else
+		else if (s_menu.searchTarget == SearchTarget::Create)
 			s_menu.selectedDefinition = 0;
 	}
 
 	void OpenSearchKeyboard(SearchTarget target)
 	{
 		s_menu.searchTarget = target;
+		s_textInputTarget.store(static_cast<int>(target), std::memory_order_release);
 		s_menu.keyboardRow = 0;
 		s_menu.keyboardColumn = 0;
+		s_menu.keyboardVisibility = MotionEnabled() ? 0.0f : 1.0f;
+		for (auto& row : s_menu.keyboardFocusAnimations)
+			row.fill(0.0f);
 		PulseHaptics(UiSound::Confirm);
 	}
 
 	void CloseSearchKeyboard()
 	{
 		s_menu.searchTarget = SearchTarget::None;
+		s_textInputTarget.store(0, std::memory_order_release);
+		s_menu.keyboardVisibility = 0.0f;
 		PulseHaptics(UiSound::Back);
+	}
+
+	void CommitSearchKeyboard()
+	{
+		if (s_menu.searchTarget == SearchTarget::Label && s_menu.details.fromLibrary &&
+			!s_menu.details.filePath.empty())
+		{
+			std::string value = s_menu.labelText.data();
+			const auto first = std::find_if_not(value.begin(), value.end(),
+				[](unsigned char c) { return std::isspace(c); });
+			const auto last = std::find_if_not(value.rbegin(), value.rend(),
+				[](unsigned char c) { return std::isspace(c); }).base();
+			value = first < last ? std::string(first, last) : std::string{};
+			const std::string key = LabelKey(s_menu.details.filePath);
+			const auto previous = s_menu.labels.find(key);
+			const std::optional<std::string> oldValue = previous == s_menu.labels.end() ?
+				std::nullopt : std::optional<std::string>(previous->second);
+			if (value.empty())
+				s_menu.labels.erase(key);
+			else
+				s_menu.labels[key] = value;
+			if (!SaveLabels())
+			{
+				if (oldValue)
+					s_menu.labels[key] = *oldValue;
+				else
+					s_menu.labels.erase(key);
+				SetToast("THE COLLECTION TAG COULD NOT BE SAVED", 2.8f);
+				PulseHaptics(UiSound::Back);
+				return;
+			}
+			RebuildLibrary();
+			SetToast(value.empty() ? "COLLECTION TAG CLEARED" : "COLLECTION TAG SAVED", 2.0f);
+		}
+		s_menu.searchTarget = SearchTarget::None;
+		s_textInputTarget.store(0, std::memory_order_release);
+		s_menu.keyboardVisibility = 0.0f;
+		PulseHaptics(UiSound::Confirm);
+	}
+
+	void OpenLabelKeyboard()
+	{
+		if (!s_menu.details.fromLibrary || s_menu.details.filePath.empty())
+			return;
+		s_menu.labelText.fill(0);
+		const std::string label = FigureLabel(s_menu.details.filePath);
+		memcpy(s_menu.labelText.data(), label.data(), std::min(label.size(), s_menu.labelText.size() - 1));
+		OpenSearchKeyboard(SearchTarget::Label);
 	}
 
 	void BackspaceSearchText()
 	{
 		auto& text = ActiveSearchText();
-		const size_t length = std::char_traits<char>::length(text.data());
+		size_t length = std::char_traits<char>::length(text.data());
 		if (length == 0)
 			return;
-		text[length - 1] = '\0';
+		do
+		{
+			--length;
+		} while (length > 0 && (static_cast<unsigned char>(text[length]) & 0xC0) == 0x80);
+		text[length] = '\0';
 		SearchTextChanged();
 		PulseHaptics();
 	}
@@ -1807,7 +2371,7 @@ namespace
 			SearchTextChanged();
 			PulseHaptics();
 			break;
-		default: CloseSearchKeyboard(); break;
+		default: CommitSearchKeyboard(); break;
 		}
 	}
 
@@ -1876,6 +2440,17 @@ namespace
 			return;
 		}
 		s_menu.selectedPortalRow = targetRow;
+		if (rows[targetRow].actualSlot >= 0)
+		{
+			const auto snapshot = nsyshid::g_skyportal.GetSkylanderSnapshot(
+				static_cast<uint8>(rows[targetRow].actualSlot));
+			if (snapshot && snapshot->physical)
+			{
+				SetToast("SELECT A VIRTUAL CARD OR LIFT THE PHYSICAL FIGURE", 2.8f);
+				PulseHaptics(UiSound::Back);
+				return;
+			}
+		}
 		const uint8 slot = PlaceFigure(figure, rows[targetRow].actualSlot);
 		if (slot == 0xFF)
 		{
@@ -1911,6 +2486,13 @@ namespace
 		if (loaded[slot])
 			if (const auto* definition = s_menu.catalog.Find(loaded[slot]->first, loaded[slot]->second))
 				name = Uppercase(definition->name);
+		if (const auto snapshot = nsyshid::g_skyportal.GetSkylanderSnapshot(static_cast<uint8>(slot));
+			snapshot && snapshot->physical)
+		{
+			SetToast("LIFT " + name + " FROM THE PHYSICAL PORTAL", 2.8f);
+			PulseHaptics(UiSound::Back);
+			return;
+		}
 		const bool removed = nsyshid::g_skyportal.RemoveSkylander(static_cast<uint8>(slot));
 		if (removed)
 			SetToast(name + " REMOVED");
@@ -2074,6 +2656,8 @@ namespace
 		}
 		s_menu.favorites.erase(FavoriteKey(source));
 		SaveFavorites();
+		s_menu.labels.erase(LabelKey(source));
+		SaveLabels();
 		s_menu.details = {};
 		s_menu.selectedLibrary = 0;
 		s_menu.reloadCatalog = true;
@@ -2098,7 +2682,7 @@ namespace
 		const float opacity = std::clamp<sint32>(
 			GetConfig().emulated_usb_devices.skylander_drawer_opacity.GetValue(), 0, 100) / 100.0f;
 		draw->AddRectFilled(shellMinimum, shellMaximum,
-			WithAlpha(theme.background, layout.alpha * (0.48f + opacity * 0.42f)));
+			WithAlpha(theme.background, layout.alpha * (0.16f + opacity * 0.72f)));
 		const int particleLevel = std::clamp<sint32>(GetConfig().emulated_usb_devices.skylander_particle_level.GetValue(), 0, 3);
 		const int moteCount = particleLevel == 0 ? 0 : particleLevel == 1 ? 12 : particleLevel == 2 ? 22 : 34;
 		for (int mote = 0; mote < moteCount; ++mote)
@@ -2110,8 +2694,6 @@ namespace
 			draw->AddCircleFilled(Point(layout, x, y), (mote % 3 == 0 ? 1.2f : 0.75f) * layout.scale,
 				WithAlpha(moteColor, layout.alpha * (mote % 4 == 0 ? 0.17f : 0.09f)), 8);
 		}
-		draw->AddLine(Point(layout, kDrawerX + 8.0f, 1.0f), Point(layout, 1272.0f, 1.0f),
-			WithAlpha(IM_COL32(189, 227, 248, 255), layout.alpha * 0.12f), layout.scale);
 		draw->AddLine({shellMinimum.x, shellMinimum.y + 2.0f * layout.scale},
 			{shellMinimum.x, shellMaximum.y - 2.0f * layout.scale},
 			WithAlpha(theme.accent, layout.alpha * 0.34f), 1.2f * layout.scale);
@@ -2119,23 +2701,52 @@ namespace
 
 	bool ClickedRect(const RiftLayout& layout, ImVec2 minimum, ImVec2 maximum)
 	{
-		return layout.alpha > 0.9f && ImGui::IsMouseClicked(0) &&
+		const bool clicked = layout.alpha > 0.9f && ImGui::IsMouseClicked(0) &&
 			ImGui::IsMouseHoveringRect(minimum, maximum);
+		if (clicked)
+			s_menu.mouseNavigationActive = true;
+		return clicked;
+	}
+
+	void UpdateMouseNavigationMode()
+	{
+		const ImVec2 position = ImGui::GetIO().MousePos;
+		if (position.x <= -FLT_MAX * 0.5f || position.y <= -FLT_MAX * 0.5f)
+			return;
+		if (!s_menu.mousePositionInitialized)
+		{
+			s_menu.lastMousePosition = position;
+			s_menu.mousePositionInitialized = true;
+			return;
+		}
+		const float x = position.x - s_menu.lastMousePosition.x;
+		const float y = position.y - s_menu.lastMousePosition.y;
+		if (x * x + y * y >= 9.0f)
+			s_menu.mouseNavigationActive = true;
+		s_menu.lastMousePosition = position;
 	}
 
 	void ActivateHeaderSelection()
 	{
+		if (s_menu.page == RiftPage::ColorEditor && s_menu.colorEditorDirty)
+		{
+			g_config.Save();
+			s_menu.colorEditorDirty = false;
+		}
 		switch (s_menu.headerSelection)
 		{
-		case 0: SetPortalMode(true); PulseHaptics(UiSound::Confirm); break;
-		case 1: SetPortalMode(false); PulseHaptics(UiSound::Confirm); break;
-		case 2:
+		case 0:
+		case 1:
+		case 2: SetPortalMode(s_menu.headerSelection); PulseHaptics(UiSound::Confirm); break;
+		case 3:
 			s_menu.page = RiftPage::Forge;
+			s_menu.focus = FocusArea::Library;
 			s_menu.forgeToolbarFocused = false;
 			PulseHaptics(UiSound::Confirm);
 			break;
-		case 3:
+		case 4:
 			s_menu.page = RiftPage::Options;
+			s_menu.focus = FocusArea::Library;
 			s_menu.selectedOption = 0;
 			PulseHaptics(UiSound::Confirm);
 			break;
@@ -2145,27 +2756,30 @@ namespace
 	void DrawHeaderTab(ImDrawList* draw, const RiftLayout& layout, int index, float x, float width,
 		std::string_view label, bool active, bool disabled = false)
 	{
+		const auto theme = CurrentTheme();
 		const ImVec2 minimum = Point(layout, x, 77);
 		const ImVec2 maximum = Point(layout, x + width, 113);
 		const bool focused = s_menu.focus == FocusArea::Header && s_menu.headerSelection == index;
 		float& focusAnimation = s_menu.headerFocusAnimations[index];
 		focusAnimation = AnimateFocus(focusAnimation, focused ? 1.0f : active ? 0.32f : 0.0f);
-		const ImU32 accent = index == 1 ? IM_COL32(91, 231, 151, 255) :
-			(index == 2 ? CurrentTheme().secondary : IM_COL32(76, 218, 255, 255));
+		const ImU32 accent = index == 1 ? IM_COL32(91, 224, 131, 255) :
+			(index == 2 ? theme.secondary : theme.accent);
+		const float radius = CornerRadius(2.0f) * layout.scale;
+		draw->PushClipRect(Point(layout, 684, 77), Point(layout, 1244, 113), true);
 		if (focusAnimation > 0.01f)
 			draw->AddRectFilled({minimum.x + 3.0f * layout.scale, minimum.y + 4.0f * layout.scale},
 				{maximum.x + 3.0f * layout.scale, maximum.y + 5.0f * layout.scale},
-				WithAlpha(IM_COL32(0, 3, 12, 255), layout.alpha * focusAnimation * 0.22f), 2.0f * layout.scale);
+				WithAlpha(IM_COL32(0, 3, 12, 255), layout.alpha * focusAnimation * 0.22f), radius);
 		if (focusAnimation > 0.01f)
 			draw->AddRectFilled(minimum, maximum,
-				WithAlpha(index == 1 ? IM_COL32(17, 55, 43, 255) :
-					(index == 2 ? IM_COL32(45, 30, 69, 255) :
-						(focused ? CurrentTheme().selectedSurface : IM_COL32(15, 38, 57, 255))),
-					layout.alpha * focusAnimation * (disabled ? 0.22f : 0.72f)), 2.0f * layout.scale);
+				WithAlpha(BlendColor(theme.surface, theme.selectedSurface, focused ? 0.34f : 0.16f),
+					layout.alpha * focusAnimation * (disabled ? 0.22f : 0.72f)), radius);
 		if (active || focused)
-			draw->AddRectFilled(Point(layout, x, 109), Point(layout, x + width, 112),
+			draw->AddRectFilled(Point(layout, x + (index == 0 ? 1.0f : 0.0f), 109),
+				Point(layout, x + width - (index == 4 ? 1.0f : 0.0f), 112),
 				WithAlpha(accent, layout.alpha * std::max(focusAnimation, active ? 0.72f : 0.0f)),
-				1.0f * layout.scale);
+				CornerRadius(1.0f) * layout.scale);
+		draw->PopClipRect();
 		DrawTextCentered(draw, Point(layout, x + width * 0.5f, 95),
 			WithAlpha(disabled ? IM_COL32(117, 140, 159, 255) :
 				(active ? Lighten(accent, 0.22f) : IM_COL32(235, 244, 251, 255)), layout.alpha),
@@ -2180,39 +2794,120 @@ namespace
 
 	void DrawHeader(ImDrawList* draw, const RiftLayout& layout)
 	{
-		const bool virtualPortal = GetConfig().emulated_usb_devices.emulate_skylander_portal;
-		const ImU32 portalColor = virtualPortal ? IM_COL32(67, 214, 255, 255) : IM_COL32(91, 231, 151, 255);
-		const ImU32 wordmarkColor = Lighten(CurrentTheme().accent, 0.58f);
-		DrawText(draw, Point(layout, 326, 34), WithAlpha(IM_COL32(0, 2, 12, 255), layout.alpha * 0.28f),
-			29.0f * layout.scale, "RIFT");
-		DrawText(draw, Point(layout, 324, 32), WithAlpha(IM_COL32(0, 2, 12, 255), layout.alpha * 0.74f),
-			29.0f * layout.scale, "RIFT");
-		DrawText(draw, Point(layout, 321, 29), WithAlpha(wordmarkColor, layout.alpha),
-			29.0f * layout.scale, "RIFT");
-		draw->AddRectFilled(Point(layout, 321, 63), Point(layout, 375, 65),
-			WithAlpha(wordmarkColor, layout.alpha * 0.88f), 1.0f * layout.scale);
-		DrawShadowedTextRightAligned(draw, Point(layout, 1244, 31), WithAlpha(portalColor, layout.alpha),
-			11.0f * layout.scale, virtualPortal ? "VIRTUAL PORTAL" : "PHYSICAL PORTAL", layout.scale);
-		DrawShadowedTextRightAligned(draw, Point(layout, 1244, 49), WithAlpha(CurrentTheme().text, layout.alpha),
-			13.0f * layout.scale, virtualPortal ? "LOCAL COLLECTION" : "USB PASSTHROUGH", layout.scale);
+		const int portalMode = PortalMode();
+		DrawTitleText(draw, layout, Point(layout, 321, 31), 27.0f * layout.scale, "RIFT", 0.18f);
+		draw->AddLine(Point(layout, 321, 59), Point(layout, 1244, 59),
+			WithAlpha(CurrentTheme().border, layout.alpha * 0.24f), layout.scale);
 
-		draw->AddRect(Point(layout, 790, 77), Point(layout, 1244, 113),
-			WithAlpha(IM_COL32(147, 190, 217, 255), layout.alpha * 0.26f), 4.0f * layout.scale);
-		DrawHeaderTab(draw, layout, 0, 790, 116, "VIRTUAL", virtualPortal);
-		DrawHeaderTab(draw, layout, 1, 908, 116, "PHYSICAL", !virtualPortal);
-		DrawHeaderTab(draw, layout, 2, 1026, 126, "CREATE .SKY", s_menu.page == RiftPage::Forge);
-		DrawHeaderTab(draw, layout, 3, 1154, 90, "OPTIONS", s_menu.page == RiftPage::Options);
-		draw->AddLine(Point(layout, 318, 126), Point(layout, 1258, 126),
-			WithAlpha(IM_COL32(165, 218, 246, 255), layout.alpha * 0.26f), 1.0f * layout.scale);
+		DrawHeaderTab(draw, layout, 0, 684, 110, "VIRTUAL", portalMode == 0);
+		DrawHeaderTab(draw, layout, 1, 794, 112, "PHYSICAL", portalMode == 1);
+		DrawHeaderTab(draw, layout, 2, 906, 104, "HYBRID", portalMode == 2);
+		DrawHeaderTab(draw, layout, 3, 1010, 128, "CREATE .SKY", s_menu.page == RiftPage::Forge);
+		DrawHeaderTab(draw, layout, 4, 1138, 106, "OPTIONS",
+			s_menu.page == RiftPage::Options || s_menu.page == RiftPage::ColorEditor);
+		draw->AddRect(Point(layout, 684, 77), Point(layout, 1244, 113),
+			WithAlpha(CurrentTheme().border, layout.alpha * 0.32f), CornerRadius(4.0f) * layout.scale);
+	}
+
+	std::array<char, 96>& SearchTextForTarget(SearchTarget target)
+	{
+		if (target == SearchTarget::Create)
+			return s_menu.forgeSearchText;
+		if (target == SearchTarget::Label)
+			return s_menu.labelText;
+		return s_menu.searchText;
+	}
+
+	void SearchTextChanged(SearchTarget target)
+	{
+		if (target == SearchTarget::Collection)
+			RebuildLibrary();
+		else if (target == SearchTarget::Create)
+			s_menu.selectedDefinition = 0;
+	}
+
+	void ProcessTextInputQueue()
+	{
+		std::deque<std::pair<int, unsigned int>> pending;
+		{
+			const std::lock_guard lock(s_textInputMutex);
+			pending.swap(s_textInputQueue);
+		}
+		for (const auto& [targetValue, codepoint] : pending)
+		{
+			if (!s_menu.requestedOpen || targetValue < static_cast<int>(SearchTarget::Collection) ||
+				targetValue > static_cast<int>(SearchTarget::Label))
+				continue;
+			const auto target = static_cast<SearchTarget>(targetValue);
+			auto& text = SearchTextForTarget(target);
+			if (codepoint == 8 || codepoint == 127)
+			{
+				size_t length = std::char_traits<char>::length(text.data());
+				if (length > 0)
+				{
+					do
+					{
+						--length;
+					} while (length > 0 && (static_cast<unsigned char>(text[length]) & 0xC0) == 0x80);
+					text[length] = '\0';
+					SearchTextChanged(target);
+				}
+				continue;
+			}
+			if (codepoint == 27)
+			{
+				if (s_menu.searchTarget != SearchTarget::None)
+					CloseSearchKeyboard();
+				else
+					s_textInputTarget.store(0, std::memory_order_release);
+				continue;
+			}
+			if (codepoint == 10 || codepoint == 13)
+			{
+				if (s_menu.searchTarget != SearchTarget::None)
+					CommitSearchKeyboard();
+				else
+					s_textInputTarget.store(0, std::memory_order_release);
+				continue;
+			}
+			if (codepoint < 32 || codepoint > 0x10FFFF)
+				continue;
+
+			std::array<char, 4> encoded{};
+			size_t encodedLength = 0;
+			if (codepoint <= 0x7F)
+				encoded[encodedLength++] = static_cast<char>(codepoint);
+			else if (codepoint <= 0x7FF)
+			{
+				encoded[encodedLength++] = static_cast<char>(0xC0 | (codepoint >> 6));
+				encoded[encodedLength++] = static_cast<char>(0x80 | (codepoint & 0x3F));
+			}
+			else if (codepoint <= 0xFFFF)
+			{
+				encoded[encodedLength++] = static_cast<char>(0xE0 | (codepoint >> 12));
+				encoded[encodedLength++] = static_cast<char>(0x80 | ((codepoint >> 6) & 0x3F));
+				encoded[encodedLength++] = static_cast<char>(0x80 | (codepoint & 0x3F));
+			}
+			else
+			{
+				encoded[encodedLength++] = static_cast<char>(0xF0 | (codepoint >> 18));
+				encoded[encodedLength++] = static_cast<char>(0x80 | ((codepoint >> 12) & 0x3F));
+				encoded[encodedLength++] = static_cast<char>(0x80 | ((codepoint >> 6) & 0x3F));
+				encoded[encodedLength++] = static_cast<char>(0x80 | (codepoint & 0x3F));
+			}
+			const size_t length = std::char_traits<char>::length(text.data());
+			if (length + encodedLength >= text.size())
+				continue;
+			memcpy(text.data() + length, encoded.data(), encodedLength);
+			text[length + encodedLength] = '\0';
+			SearchTextChanged(target);
+		}
 	}
 
 	void DrawPortalColumn(ImDrawList* draw, const RiftLayout& layout)
 	{
-		const bool virtualPortal = GetConfig().emulated_usb_devices.emulate_skylander_portal;
-		DrawText(draw, Point(layout, 334, 158), WithAlpha(CurrentTheme().text, layout.alpha),
-			18.0f * layout.scale, "CURRENT PORTAL");
-		DrawText(draw, Point(layout, 1094, 163), WithAlpha(IM_COL32(139, 174, 199, 255), layout.alpha),
-			11.0f * layout.scale, virtualPortal ? "VIRTUAL LOADOUT" : "HARDWARE CONTROL");
+		const bool virtualPortal = VirtualPortalAvailable();
+		DrawTitleText(draw, layout, Point(layout, 334, 158), 18.0f * layout.scale, "CURRENT PORTAL");
 
 		const auto rows = virtualPortal ? BuildPortalRows() : std::vector<PortalRow>(1);
 		s_menu.selectedPortalRow = std::clamp(s_menu.selectedPortalRow, 0,
@@ -2241,12 +2936,12 @@ namespace
 			}
 			const float x = cardX;
 			const float width = cardWidth;
-			const ImVec2 minimum = Point(layout, x, 190);
-			const ImVec2 maximum = Point(layout, x + width, 282);
+			const ImVec2 minimum = Point(layout, x, 184);
+			const ImVec2 maximum = Point(layout, x + width, 250);
 			const bool focused = s_menu.focus == FocusArea::Portal && s_menu.selectedPortalRow == rowIndex;
 			float& focusAnimation = s_menu.portalFocusAnimations[rowIndex];
 			focusAnimation = AnimateFocus(focusAnimation, focused ? 1.0f : 0.0f);
-			ImU32 accent = IM_COL32(79, 210, 255, 255);
+			ImU32 accent = CurrentTheme().accent;
 			ArtworkTexture rowTexture;
 			if (rows[rowIndex].definition)
 			{
@@ -2281,30 +2976,46 @@ namespace
 				default: slotLabel = "SKYLANDER"; break;
 				}
 			}
-			DrawTextFit(draw, Point(layout, x + 9, 199), WithAlpha(CurrentTheme().muted, layout.alpha),
-				9.5f * layout.scale, DrawerWidth(layout, width - 17.0f), slotLabel);
-			s_menu.portalTargets[rowIndex] = Point(layout, x + 31, 244);
-
+			const bool roomy = width >= 180.0f;
+			const bool showGame = width >= 260.0f;
+			const float artX = roomy ? x + 30.0f : x + 24.0f;
+			const float textX = roomy ? x + 60.0f : x + 47.0f;
+			s_menu.portalTargets[rowIndex] = Point(layout, artX, 218);
 			if (rows[rowIndex].actualSlot >= 0)
 			{
 				const bool hiddenDuringPlacement =
 					s_menu.placementAnimation < 1.0f && rows[rowIndex].actualSlot == s_menu.placementSlot;
 				if (!hiddenDuringPlacement)
 					DrawCard(draw, rowTexture,
-						s_menu.portalTargets[rowIndex], (67.0f + focusAnimation * 3.0f) * layout.scale,
+						s_menu.portalTargets[rowIndex], (44.0f + focusAnimation * 2.0f) * layout.scale,
 						0.0f, focusAnimation, layout.alpha);
 				const std::string name = rows[rowIndex].definition ? rows[rowIndex].definition->name :
 					fmt::format("Unknown ({}, {})", rows[rowIndex].id, rows[rowIndex].variant);
-				DrawTextFit(draw, Point(layout, x + 58, 226), WithAlpha(CurrentTheme().text, layout.alpha),
-						11.5f * layout.scale, DrawerWidth(layout, std::max(42.0f, width - 64.0f)), Uppercase(name));
-				DrawText(draw, Point(layout, x + 58, 254), WithAlpha(accent, layout.alpha),
-					10.5f * layout.scale, fmt::format("SLOT {:02}", rows[rowIndex].actualSlot + 1));
+				DrawTextFit(draw, Point(layout, textX, 190), WithAlpha(CurrentTheme().muted, layout.alpha),
+					9.0f * layout.scale, DrawerWidth(layout, std::max(35.0f, width - (textX - x) - 12.0f)), slotLabel);
+				DrawTextFit(draw, Point(layout, textX, 207), WithAlpha(CurrentTheme().text, layout.alpha),
+					11.5f * layout.scale, DrawerWidth(layout, std::max(35.0f, width - (textX - x) - (roomy ? 78.0f : 10.0f))), Uppercase(name));
+				if (rows[rowIndex].definition)
+					DrawText(draw, Point(layout, textX, 226), WithAlpha(accent, layout.alpha),
+						9.5f * layout.scale, ElementName(rows[rowIndex].definition->element));
+				if (roomy)
+				{
+					if (rows[rowIndex].definition && showGame)
+						DrawTextRightAligned(draw, Point(layout, x + width - 12.0f, 190),
+							WithAlpha(CurrentTheme().muted, layout.alpha * 0.82f), 8.5f * layout.scale,
+							FigureGameName(rows[rowIndex].definition->game));
+					DrawTextRightAligned(draw, Point(layout, x + width - 12.0f, 226),
+						WithAlpha(accent, layout.alpha), 9.5f * layout.scale,
+						fmt::format("SLOT {:02}", rows[rowIndex].actualSlot + 1));
+				}
 			}
 			else
 			{
-				DrawTextFit(draw, Point(layout, x + 10, 237), WithAlpha(CurrentTheme().muted, layout.alpha * 0.72f),
-					12.0f * layout.scale, DrawerWidth(layout, std::max(42.0f, width - 20.0f)),
-					virtualPortal ? (width > 260 ? "CHOOSE A CARD BELOW TO ADD IT" : "ADD CARD") : "PLACE A FIGURE ON YOUR PORTAL");
+				DrawText(draw, Point(layout, x + 12, 198), WithAlpha(CurrentTheme().text, layout.alpha),
+					11.0f * layout.scale, virtualPortal ? "ADD CARD" : "PHYSICAL PORTAL");
+				DrawTextFit(draw, Point(layout, x + 12, 220), WithAlpha(CurrentTheme().muted, layout.alpha * 0.82f),
+					10.5f * layout.scale, DrawerWidth(layout, std::max(42.0f, width - 24.0f)),
+					virtualPortal ? "CHOOSE FROM THE LIBRARY" : "PLACE A FIGURE ON YOUR PORTAL");
 			}
 			if (ClickedRect(layout, minimum, maximum))
 			{
@@ -2320,17 +3031,17 @@ namespace
 			DrawText(draw, Point(layout, 1120, 164), WithAlpha(CurrentTheme().accent, layout.alpha),
 				10.0f * layout.scale, fmt::format("{}-{} OF {}", firstVisible + 1,
 					firstVisible + visibleCount, rows.size()));
-		draw->AddLine(Point(layout, 334, 293), Point(layout, 1244, 293),
-			WithAlpha(IM_COL32(151, 202, 231, 255), layout.alpha * 0.20f), layout.scale);
+		draw->AddLine(Point(layout, 334, 260), Point(layout, 1244, 260),
+			WithAlpha(CurrentTheme().border, layout.alpha * 0.28f), layout.scale);
 	}
 
 	void DrawSearchIcon(ImDrawList* draw, const RiftLayout& layout, ImVec2 center)
 	{
-		draw->AddCircle(center, 6.0f * layout.scale, WithAlpha(IM_COL32(169, 198, 220, 255), layout.alpha),
+		draw->AddCircle(center, 6.0f * layout.scale, WithAlpha(CurrentTheme().muted, layout.alpha),
 			24, 1.6f * layout.scale);
 		draw->AddLine({center.x + 4.5f * layout.scale, center.y + 4.5f * layout.scale},
 			{center.x + 10.0f * layout.scale, center.y + 10.0f * layout.scale},
-			WithAlpha(IM_COL32(169, 198, 220, 255), layout.alpha), 1.6f * layout.scale);
+			WithAlpha(CurrentTheme().muted, layout.alpha), 1.6f * layout.scale);
 	}
 
 	ArtworkTexture GetControllerGlyph(std::string_view glyph);
@@ -2349,31 +3060,37 @@ namespace
 
 	void DrawLibraryToolbar(ImDrawList* draw, const RiftLayout& layout)
 	{
-		DrawText(draw, Point(layout, 334, 306), WithAlpha(CurrentTheme().text, layout.alpha),
-			18.0f * layout.scale, "LIBRARY");
+		const auto theme = CurrentTheme();
+		DrawTitleText(draw, layout, Point(layout, 334, 271), 18.0f * layout.scale, "LIBRARY");
 		if (!s_menu.library.empty())
-			DrawTextFit(draw, Point(layout, 425, 309), WithAlpha(IM_COL32(126, 208, 238, 255), layout.alpha),
+		{
+			std::string selectedName = Uppercase(ShortName(s_menu.library[s_menu.selectedLibrary].name, 36));
+			const std::string label = FigureLabel(s_menu.library[s_menu.selectedLibrary].filePath);
+			if (!label.empty())
+				selectedName += "  /  " + Uppercase(ShortName(label, 28));
+			DrawTextFit(draw, Point(layout, 425, 274), WithAlpha(theme.accent, layout.alpha),
 				12.0f * layout.scale, DrawerWidth(layout, 610.0f),
-				Uppercase(ShortName(s_menu.library[s_menu.selectedLibrary].name, 44)));
-		DrawText(draw, Point(layout, 1202, 310), WithAlpha(IM_COL32(142, 175, 199, 255), layout.alpha),
+				selectedName);
+		}
+		DrawText(draw, Point(layout, 1202, 275), WithAlpha(theme.muted, layout.alpha),
 			11.0f * layout.scale, fmt::format("{:02}", s_menu.library.size()));
 
-		const ImVec2 toolbarMin = Point(layout, 334, 330);
-		const ImVec2 toolbarMax = Point(layout, 1244, 369);
+		const ImVec2 toolbarMin = Point(layout, 334, 294);
+		const ImVec2 toolbarMax = Point(layout, 1244, 333);
 		draw->AddRectFilled(toolbarMin, toolbarMax,
-			WithAlpha(IM_COL32(5, 15, 30, 220), layout.alpha * 0.84f), 5.0f * layout.scale);
+			WithAlpha(theme.surface, layout.alpha * 0.76f), 5.0f * layout.scale);
 		draw->AddRect(toolbarMin, toolbarMax,
 			WithAlpha(CurrentTheme().border, layout.alpha * 0.28f), 5.0f * layout.scale);
-		draw->AddLine(Point(layout, 650, 335), Point(layout, 650, 364),
+		draw->AddLine(Point(layout, 650, 299), Point(layout, 650, 328),
 			WithAlpha(CurrentTheme().border, layout.alpha * 0.22f), layout.scale);
-		draw->AddLine(Point(layout, 930, 335), Point(layout, 930, 364),
+		draw->AddLine(Point(layout, 930, 299), Point(layout, 930, 328),
 			WithAlpha(CurrentTheme().border, layout.alpha * 0.22f), layout.scale);
-		const ImVec2 searchMin = Point(layout, 334, 330);
-		const ImVec2 searchMax = Point(layout, 650, 369);
+		const ImVec2 searchMin = Point(layout, 334, 294);
+		const ImVec2 searchMax = Point(layout, 650, 333);
 		if (s_menu.focus == FocusArea::Search)
 			DrawElevatedSurface(draw, layout, searchMin, searchMax, true);
-		DrawSearchIcon(draw, layout, Point(layout, 355, 348));
-		ImGui::SetCursorScreenPos(Point(layout, 375, 334));
+		DrawSearchIcon(draw, layout, Point(layout, 355, 312));
+		ImGui::SetCursorScreenPos(Point(layout, 375, 298));
 		ImGui::SetNextItemWidth(DrawerWidth(layout, 260.0f));
 		ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, {0, 7.0f * layout.scale});
 		ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(0, 0, 0, 0));
@@ -2386,30 +3103,32 @@ namespace
 		if (ImGui::InputTextWithHint("##rift_search", "Search collection...", s_menu.searchText.data(),
 			s_menu.searchText.size()))
 			RebuildLibrary();
+		if (ImGui::IsItemActive())
+			s_textInputTarget.store(static_cast<int>(SearchTarget::Collection), std::memory_order_release);
 		if (searchFont)
 			ImGui::PopFont();
 		ImGui::PopStyleColor(4);
 		ImGui::PopStyleVar();
 
-		const ImVec2 sortMin = Point(layout, 650, 330);
-		const ImVec2 sortMax = Point(layout, 930, 369);
-		DrawInlineGlyph(draw, layout, Point(layout, 675, 349), "LB", 24.0f);
-		DrawTextFit(draw, Point(layout, 698, 338), WithAlpha(CurrentTheme().text, layout.alpha),
+		const ImVec2 sortMin = Point(layout, 650, 294);
+		const ImVec2 sortMax = Point(layout, 930, 333);
+		DrawInlineGlyph(draw, layout, Point(layout, 675, 313), "LB", 24.0f);
+		DrawTextFit(draw, Point(layout, 698, 302), WithAlpha(CurrentTheme().text, layout.alpha),
 			12.0f * layout.scale, DrawerWidth(layout, 216.0f), SortModeName());
 		if (ClickedRect(layout, sortMin, sortMax))
 			OpenLibraryOrder();
 
-		const ImVec2 favoriteMin = Point(layout, 930, 330);
-		const ImVec2 favoriteMax = Point(layout, 1244, 369);
+		const ImVec2 favoriteMin = Point(layout, 930, 294);
+		const ImVec2 favoriteMax = Point(layout, 1244, 333);
 		const bool favorite = !s_menu.library.empty() && IsFavorite(s_menu.library[s_menu.selectedLibrary].filePath);
 		if (favorite)
 			draw->AddRectFilled(favoriteMin, favoriteMax,
 				WithAlpha(IM_COL32(91, 69, 18, 220), layout.alpha * 0.52f), 0.0f);
-		DrawInlineGlyph(draw, layout, Point(layout, 955, 349), "RB", 24.0f);
+		DrawInlineGlyph(draw, layout, Point(layout, 955, 313), "RB", 24.0f);
 		if (favorite)
-			DrawStar(draw, Point(layout, 988, 349), 7.0f * layout.scale,
+			DrawFavoriteIcon(draw, Point(layout, 988, 313), 13.0f * layout.scale,
 				WithAlpha(IM_COL32(255, 210, 91, 255), layout.alpha));
-		DrawText(draw, Point(layout, favorite ? 1003 : 980, 338),
+		DrawText(draw, Point(layout, favorite ? 1003 : 980, 302),
 			WithAlpha(CurrentTheme().text, layout.alpha),
 			12.0f * layout.scale, favorite ? "FAVORITED" : "ADD FAVORITE");
 		if (ClickedRect(layout, favoriteMin, favoriteMax))
@@ -2448,8 +3167,337 @@ namespace
 		return offset;
 	}
 
+	struct CascadeRowFilter
+	{
+		int type{};
+		int game{};
+		int element{};
+	};
+
+	struct CascadeRowData
+	{
+		CascadeRowFilter filter;
+		std::string label;
+		std::vector<int> indices;
+	};
+
+	std::string_view CascadeTypeName(int type)
+	{
+		switch (type)
+		{
+		case 1: return "SKYLANDERS";
+		case 2: return "TRAPS";
+		case 3: return "VEHICLES";
+		case 4: return "ITEMS & CRYSTALS";
+		default: return "ALL TYPES";
+		}
+	}
+
+	std::string_view CascadeGameName(int game)
+	{
+		if (game <= 0)
+			return "ALL GAMES";
+		return FigureGameName(static_cast<skylander_ui::FigureGame>(std::clamp(game, 1, 6)));
+	}
+
+	std::vector<CascadeRowFilter> ParseCustomCascadeRows()
+	{
+		std::vector<CascadeRowFilter> rows;
+		std::stringstream stream(GetConfig().emulated_usb_devices.skylander_cascade_rows.GetValue());
+		std::string rowText;
+		while (rows.size() < kMaximumCascadeRows && std::getline(stream, rowText, ';'))
+		{
+			std::stringstream rowStream(rowText);
+			std::string value;
+			std::array<int, 3> fields{};
+			int field = 0;
+			while (field < static_cast<int>(fields.size()) && std::getline(rowStream, value, ','))
+			{
+				try { fields[field] = std::stoi(value); }
+				catch (...) { fields[field] = 0; }
+				++field;
+			}
+			if (field > 0)
+				rows.push_back({std::clamp(fields[0], 0, 4), std::clamp(fields[1], 0, 6),
+					std::clamp(fields[2], 0, 11)});
+		}
+		if (rows.empty())
+			rows = {{1, 0, 0}, {2, 0, 0}, {0, 4, 0}};
+		return rows;
+	}
+
+	void SaveCustomCascadeRows(const std::vector<CascadeRowFilter>& rows)
+	{
+		std::string value;
+		for (size_t index = 0; index < rows.size(); ++index)
+		{
+			if (index)
+				value += ';';
+			value += fmt::format("{},{},{}", rows[index].type, rows[index].game, rows[index].element);
+		}
+		GetConfig().emulated_usb_devices.skylander_cascade_rows = value;
+	}
+
+	std::string CascadeRowLabel(const CascadeRowFilter& filter)
+	{
+		std::string label;
+		auto append = [&](std::string_view part) {
+			if (!label.empty())
+				label += "  /  ";
+			label += part;
+		};
+		if (filter.game)
+			append(CascadeGameName(filter.game));
+		if (filter.type)
+			append(CascadeTypeName(filter.type));
+		if (filter.element)
+			append(ElementChoiceName(filter.element, "ALL"));
+		return label.empty() ? "ALL FIGURES" : label;
+	}
+
+	bool MatchesCascadeRow(const skylander_ui::CollectionFigure& figure, const CascadeRowFilter& filter)
+	{
+		using skylander_ui::FigureType;
+		if (filter.type == 1 && figure.type != FigureType::Skylander)
+			return false;
+		if (filter.type == 2 && figure.type != FigureType::Trap)
+			return false;
+		if (filter.type == 3 && figure.type != FigureType::Vehicle)
+			return false;
+		if (filter.type == 4 && figure.type != FigureType::Item &&
+			figure.type != FigureType::CreationCrystal && figure.type != FigureType::RacingDriver)
+			return false;
+		if (filter.element && figure.element != ElementForChoice(filter.element))
+			return false;
+		if (filter.game)
+		{
+			const auto* definition = s_menu.catalog.Find(figure.id, figure.variant);
+			if (!definition || static_cast<int>(definition->game) != filter.game)
+				return false;
+		}
+		return true;
+	}
+
+	const std::vector<CascadeRowData>& BuildCascadeRows()
+	{
+		auto& config = GetConfig().emulated_usb_devices;
+		const int layoutMode = std::clamp<sint32>(config.skylander_cascade_rows_layout.GetValue(), 0, 3);
+		const std::string rowSpecification = config.skylander_cascade_rows.GetValue();
+		static uint64 cachedGeneration = static_cast<uint64>(-1);
+		static int cachedLayout = -1;
+		static std::string cachedSpecification;
+		static std::vector<CascadeRowData> rows;
+		if (cachedGeneration == s_libraryGeneration && cachedLayout == layoutMode &&
+			cachedSpecification == rowSpecification)
+			return rows;
+		cachedGeneration = s_libraryGeneration;
+		cachedLayout = layoutMode;
+		cachedSpecification = rowSpecification;
+		rows.clear();
+		std::vector<CascadeRowFilter> filters;
+		if (layoutMode == 1)
+			filters = {{1, 0, 0}, {2, 0, 0}, {3, 0, 0}, {4, 0, 0}};
+		else if (layoutMode == 2)
+			filters = {{0, 1, 0}, {0, 2, 0}, {0, 3, 0}, {0, 4, 0}, {0, 5, 0}, {0, 6, 0}};
+		else if (layoutMode == 3)
+			filters = ParseCustomCascadeRows();
+		else
+			filters = {{0, 0, 0}};
+
+		for (const auto& filter : filters)
+		{
+			CascadeRowData row{filter, CascadeRowLabel(filter), {}};
+			for (int index = 0; index < static_cast<int>(s_menu.library.size()); ++index)
+			{
+				if (MatchesCascadeRow(s_menu.library[index], filter))
+					row.indices.push_back(index);
+			}
+			if (!row.indices.empty() || layoutMode == 3 || layoutMode == 0)
+				rows.push_back(std::move(row));
+		}
+		if (rows.empty())
+			rows.push_back({{}, "ALL FIGURES", {}});
+		return rows;
+	}
+
+	void SelectCascadeRowCard(const std::vector<CascadeRowData>& rows, int rowIndex)
+	{
+		if (rows.empty())
+			return;
+		s_menu.selectedCascadeRow = std::clamp(rowIndex, 0, static_cast<int>(rows.size()) - 1);
+		const auto& indices = rows[s_menu.selectedCascadeRow].indices;
+		if (indices.empty())
+			return;
+		int& position = s_menu.cascadeRowPositions[s_menu.selectedCascadeRow];
+		position = std::clamp(position, 0, static_cast<int>(indices.size()) - 1);
+		s_menu.selectedLibrary = indices[position];
+	}
+
+	void DrawCascadeRows(ImDrawList* draw, const RiftLayout& layout, const std::vector<CascadeRowData>& rows)
+	{
+		const auto theme = CurrentTheme();
+		s_menu.selectedCascadeRow = std::clamp(s_menu.selectedCascadeRow, 0,
+			std::max(0, static_cast<int>(rows.size()) - 1));
+		const int visibleCount = std::min(3, static_cast<int>(rows.size()));
+		const int firstVisible = std::clamp(s_menu.selectedCascadeRow - 1, 0,
+			std::max(0, static_cast<int>(rows.size()) - visibleCount));
+		const float rowSpacing = visibleCount == 2 ? 118.0f : 75.0f;
+		const float targetViewport = visibleCount == 1 ? static_cast<float>(s_menu.selectedCascadeRow) :
+			(visibleCount == 2 ? 0.5f : static_cast<float>(firstVisible + 1));
+		if (s_menu.cascadeViewport < 0.0f || !MotionEnabled())
+			s_menu.cascadeViewport = targetViewport;
+		else
+			s_menu.cascadeViewport = SmoothTowards(s_menu.cascadeViewport, targetViewport,
+				MotionValue(16.0f, 6.5f, 4.8f, 3.8f));
+		const int requestedDensity = std::clamp<sint32>(
+			GetConfig().emulated_usb_devices.skylander_card_density.GetValue(), 5, 15);
+		const int density = requestedDensity % 2 == 0 ? requestedDensity + 1 : requestedDensity;
+		const int cascadeStyle = std::clamp<sint32>(
+			GetConfig().emulated_usb_devices.skylander_cascade_style.GetValue(), 0, 3);
+		const int cardEffect = CardEffect();
+		const float time = static_cast<float>(ImGui::GetTime());
+
+		for (int rowIndex = 0; rowIndex < static_cast<int>(rows.size()) && rowIndex < kMaximumCascadeRows; ++rowIndex)
+		{
+			const auto& row = rows[rowIndex];
+			const bool selectedRow = rowIndex == s_menu.selectedCascadeRow;
+			float& rowFocus = s_menu.cascadeRowFocusAnimations[rowIndex];
+			rowFocus = AnimateFocus(rowFocus, selectedRow ? 1.0f : 0.0f);
+			const float rowDrift = AmbientMotionEnabled() ?
+				std::sin(time * 0.58f * AmbientTempo() + rowIndex * 0.71f) *
+					1.4f * AmbientStrength() * rowFocus : 0.0f;
+			const float rowBaselineY = 528.0f + (static_cast<float>(rowIndex) - s_menu.cascadeViewport) *
+				rowSpacing + rowDrift;
+			if (rowBaselineY < 440.0f || rowBaselineY > 616.0f)
+				continue;
+			if (rowFocus > 0.01f)
+				draw->AddRectFilled(Point(layout, 340, rowBaselineY - 78.0f), Point(layout, 1238, rowBaselineY + 7.0f),
+					WithAlpha(theme.selectedSurface, layout.alpha * rowFocus * 0.13f), CornerRadius(5.0f) * layout.scale);
+			DrawTextFit(draw, Point(layout, 350, rowBaselineY - 75.0f),
+				WithAlpha(BlendColor(theme.muted, theme.accent, rowFocus),
+					layout.alpha * (0.62f + rowFocus * 0.30f)),
+				9.5f * layout.scale, DrawerWidth(layout, 190.0f), row.label);
+			DrawTextRightAligned(draw, Point(layout, 1228, rowBaselineY - 75.0f),
+				WithAlpha(BlendColor(theme.muted, theme.secondary, rowFocus),
+					layout.alpha * (0.42f + rowFocus * 0.30f)),
+				8.5f * layout.scale, fmt::format("{} CARDS", row.indices.size()));
+			if (row.indices.empty())
+			{
+				DrawText(draw, Point(layout, 350, rowBaselineY - 43.0f), WithAlpha(theme.muted, layout.alpha * 0.60f),
+					10.5f * layout.scale, "NO CARDS MATCH THIS ROW");
+				continue;
+			}
+
+			int& selectedPosition = s_menu.cascadeRowPositions[rowIndex];
+			const auto current = std::find(row.indices.begin(), row.indices.end(), s_menu.selectedLibrary);
+			if (selectedRow && current != row.indices.end())
+				selectedPosition = static_cast<int>(current - row.indices.begin());
+			selectedPosition = std::clamp(selectedPosition, 0, static_cast<int>(row.indices.size()) - 1);
+			const int visibleCardCount = std::min(density, static_cast<int>(row.indices.size()));
+			const float spacing = visibleCardCount <= 5 ? 88.0f : visibleCardCount <= 7 ? 80.0f :
+				visibleCardCount <= 11 ? 65.0f : visibleCardCount <= 13 ? 56.0f : 49.0f;
+
+			struct RowCard
+			{
+				int position;
+				float offset;
+			};
+			std::array<RowCard, 17> cards{};
+			int cardCount = 0;
+			auto addCard = [&](int relative) {
+				if (cardCount >= visibleCardCount)
+					return;
+				int position = (selectedPosition + relative) % static_cast<int>(row.indices.size());
+				if (position < 0) position += static_cast<int>(row.indices.size());
+				bool duplicate = false;
+				for (int existing = 0; existing < cardCount; ++existing)
+					duplicate |= cards[existing].position == position;
+				if (duplicate)
+					return;
+				const int libraryIndex = row.indices[position];
+				const std::string key = fmt::format("{}:{}", rowIndex,
+					FavoriteKey(s_menu.library[libraryIndex].filePath));
+				auto existing = s_cascadeCardOffsets.find(key);
+				if (existing == s_cascadeCardOffsets.end())
+					existing = s_cascadeCardOffsets.emplace(key, static_cast<float>(relative)).first;
+				const float resetDistance = static_cast<float>(std::max(2, visibleCardCount / 2 + 1));
+				if (std::abs(existing->second - relative) > resetDistance)
+					existing->second = static_cast<float>(relative);
+				existing->second = MotionEnabled() ? SmoothTowards(existing->second,
+					static_cast<float>(relative), CarouselResponse()) : static_cast<float>(relative);
+				cards[cardCount++] = {position, existing->second};
+			};
+			addCard(0);
+			for (int distance = 1; cardCount < visibleCardCount; ++distance)
+			{
+				addCard(-distance);
+				addCard(distance);
+			}
+			std::sort(cards.begin(), cards.begin() + cardCount, [](const RowCard& left, const RowCard& right) {
+				return std::abs(left.offset) > std::abs(right.offset);
+			});
+
+			for (int card = 0; card < cardCount; ++card)
+			{
+				const int libraryIndex = row.indices[cards[card].position];
+				const float distance = std::abs(cards[card].offset);
+				const bool selectedCard = selectedRow && cards[card].position == selectedPosition;
+				const std::string focusKey = fmt::format("{}:{}", rowIndex,
+					FavoriteKey(s_menu.library[libraryIndex].filePath));
+				float& focus = s_cascadeCardFocusAmounts[focusKey];
+				focus = AnimateFocus(focus, selectedCard ? 1.0f : 0.0f);
+				auto texture = GetArtworkTexture(s_menu.library[libraryIndex].imagePath);
+				texture.accent = ElementColor(s_menu.library[libraryIndex].element, texture.accent);
+				const float magicPulse = AmbientMotionEnabled() ?
+					0.5f + 0.5f * std::sin(time * 1.18f * AmbientTempo() + libraryIndex * 0.21f) : 0.5f;
+				const float lift = focus * (3.5f +
+					(magicPulse - 0.5f) * 0.6f * AmbientStrength());
+				const float visualDistance = std::min(distance, 4.0f);
+				const float depthStep = cascadeStyle == 2 ? 0.0f : cascadeStyle == 3 ? 4.2f :
+					cascadeStyle == 1 ? 0.7f : 1.4f;
+				const float height = 64.0f + rowFocus * 4.0f - visualDistance * depthStep + focus * 4.0f;
+				const float cascadeDrop = cascadeStyle == 1 ? visualDistance * 0.7f : cascadeStyle == 2 ? 0.0f :
+					cascadeStyle == 3 ? visualDistance * 1.8f : visualDistance * visualDistance * 0.55f;
+				const ImVec2 center = Point(layout, 790.0f + cards[card].offset * spacing,
+					rowBaselineY - height * 0.5f + cascadeDrop - lift);
+				if (focus > 0.01f && cardEffect >= 1)
+				{
+					DrawGlow(draw, center, 67.0f * layout.scale, texture.accent,
+						layout.alpha * focus * (0.36f + magicPulse * 0.11f));
+					if (cardEffect >= 2)
+						DrawCardAura(draw, center, 58.0f * layout.scale, texture.accent, focus, layout.alpha);
+				}
+				const float fanOffset = std::clamp(cards[card].offset, -4.0f, 4.0f);
+				const float fanTilt = fanOffset * (cascadeStyle == 1 ? 0.048f : cascadeStyle == 2 ? 0.0f :
+					cascadeStyle == 3 ? 0.012f : 0.025f);
+				const float focusTilt = AmbientMotionEnabled() ? focus *
+					std::sin(time * 0.64f * AmbientTempo() + libraryIndex * 0.17f) *
+					0.006f * AmbientStrength() : 0.0f;
+				DrawCard(draw, texture, center, height * layout.scale, fanTilt + focusTilt,
+					focus, layout.alpha * (0.60f + rowFocus * 0.36f));
+				const float width = height * (texture.id && texture.size.y > 0.0f ? texture.size.x / texture.size.y : 0.64f);
+				const ImVec2 minimum{center.x - width * 0.60f * layout.scale, center.y - height * 0.60f * layout.scale};
+				const ImVec2 maximum{center.x + width * 0.60f * layout.scale, center.y + height * 0.66f * layout.scale};
+				if (ClickedRect(layout, minimum, maximum))
+				{
+					const int old = s_menu.selectedLibrary;
+					s_menu.selectedCascadeRow = rowIndex;
+					selectedPosition = cards[card].position;
+					s_menu.selectedLibrary = libraryIndex;
+					s_menu.focus = FocusArea::Library;
+					UpdateSelectedAnimation(old);
+					PulseHaptics();
+				}
+				if (selectedCard)
+					s_menu.selectedCardCenter = center;
+			}
+		}
+		SelectCascadeRowCard(rows, s_menu.selectedCascadeRow);
+	}
+
 	void DrawLibraryGrid(ImDrawList* draw, const RiftLayout& layout)
 	{
+		const auto theme = CurrentTheme();
 		const int activeElement = GetConfig().emulated_usb_devices.skylander_element_filter.GetValue();
 		constexpr float filterStartX = 334.0f;
 		constexpr float filterEndX = 1244.0f;
@@ -2458,21 +3506,20 @@ namespace
 		for (int choice = 0; choice < 12; ++choice)
 		{
 			const float x = filterStartX + choice * (filterWidth + filterGap);
-			const ImVec2 lo = Point(layout, x, 373);
-			const ImVec2 hi = Point(layout, x + filterWidth, 392);
+			const ImVec2 lo = Point(layout, x, 338);
+			const ImVec2 hi = Point(layout, x + filterWidth, 357);
 			const bool active = choice == activeElement;
 			const bool focused = s_menu.focus == FocusArea::ElementFilter &&
 				s_menu.selectedElementFilter == choice;
 			float& filterFocus = s_menu.elementFilterFocus[choice];
 			filterFocus = AnimateFocus(filterFocus, focused ? 1.0f : active ? 0.48f : 0.0f);
 			const ImU32 color = choice == 0 ? CurrentTheme().accent : ElementColor(ElementForChoice(choice), CurrentTheme().accent);
+			const float radius = CornerRadius(4.0f) * layout.scale;
 			draw->AddRectFilled(lo, hi, WithAlpha(BlendColor(CurrentTheme().surface,
-				CurrentTheme().selectedSurface, filterFocus), layout.alpha * 0.78f), 4.0f * layout.scale);
+				CurrentTheme().selectedSurface, filterFocus * 0.42f), layout.alpha * 0.78f), radius);
 			draw->AddRect(lo, hi, WithAlpha(BlendColor(CurrentTheme().border, color, filterFocus),
-				layout.alpha * (0.24f + filterFocus * 0.68f)), 4.0f * layout.scale, 0,
+				layout.alpha * (0.24f + filterFocus * 0.68f)), radius, 0,
 				(1.0f + filterFocus) * layout.scale);
-			draw->AddLine({lo.x + DrawerWidth(layout, 5.0f), hi.y}, {hi.x - DrawerWidth(layout, 5.0f), hi.y},
-				WithAlpha(color, layout.alpha * (0.25f + 0.70f * filterFocus)), (1.0f + filterFocus) * layout.scale);
 			DrawTextCentered(draw, {(lo.x + hi.x) * 0.5f, (lo.y + hi.y) * 0.5f},
 				WithAlpha(BlendColor(CurrentTheme().muted, color, filterFocus), layout.alpha),
 				9.5f * layout.scale, ElementChoiceName(choice, "ALL"));
@@ -2483,6 +3530,24 @@ namespace
 				ApplySelectedElementFilter();
 			}
 		}
+		const ImVec2 railMin = Point(layout, 334, 371);
+		const ImVec2 railMax = Point(layout, 1244, 616);
+		const float railInset = DrawerWidth(layout, 18.0f);
+		const float railSpan = DrawerWidth(layout, 72.0f);
+		const float verticalSpan = 38.0f * layout.scale;
+		const ImU32 railColor = WithAlpha(theme.border, layout.alpha * 0.14f);
+		const ImU32 horizontalAccent = WithAlpha(theme.secondary, layout.alpha * 0.20f);
+		const ImU32 verticalAccent = WithAlpha(theme.accent, layout.alpha * 0.18f);
+		draw->AddLine({railMin.x + railInset, railMin.y}, {railMin.x + railInset + railSpan, railMin.y}, railColor, layout.scale);
+		draw->AddLine({railMax.x - railInset - railSpan, railMin.y}, {railMax.x - railInset, railMin.y}, railColor, layout.scale);
+		draw->AddLine({railMin.x + railInset, railMax.y}, {railMin.x + railInset + railSpan, railMax.y}, railColor, layout.scale);
+		draw->AddLine({railMax.x - railInset - railSpan, railMax.y}, {railMax.x - railInset, railMax.y}, railColor, layout.scale);
+		const float middleX = (railMin.x + railMax.x) * 0.5f;
+		draw->AddLine({middleX - railSpan * 0.55f, railMin.y}, {middleX + railSpan * 0.55f, railMin.y}, horizontalAccent, layout.scale);
+		draw->AddLine({middleX - railSpan * 0.55f, railMax.y}, {middleX + railSpan * 0.55f, railMax.y}, horizontalAccent, layout.scale);
+		const float middleY = (railMin.y + railMax.y) * 0.5f;
+		draw->AddLine({railMin.x, middleY - verticalSpan}, {railMin.x, middleY + verticalSpan}, verticalAccent, layout.scale);
+		draw->AddLine({railMax.x, middleY - verticalSpan}, {railMax.x, middleY + verticalSpan}, verticalAccent, layout.scale);
 		if (s_menu.library.empty())
 		{
 			const std::string catalogError = s_menu.catalog.GetError();
@@ -2508,15 +3573,41 @@ namespace
 				heading = "COLLECTION FOLDER COULD NOT BE FOUND";
 				guidance = "CHOOSE AN EXISTING FOLDER IN GENERAL SETTINGS";
 			}
-			DrawTextCentered(draw, Point(layout, 790, 475),
-				WithAlpha(IM_COL32(224, 237, 246, 255), layout.alpha),
+			DrawTextCentered(draw, Point(layout, 790, 456),
+				WithAlpha(theme.text, layout.alpha),
 				20.0f * layout.scale, heading);
-			DrawTextCentered(draw, Point(layout, 790, 508),
-				WithAlpha(IM_COL32(145, 177, 200, 255), layout.alpha),
+			DrawTextCentered(draw, Point(layout, 790, 489),
+				WithAlpha(theme.muted, layout.alpha),
 				13.0f * layout.scale, Uppercase(guidance));
 			return;
 		}
 		s_menu.selectedLibrary = std::clamp(s_menu.selectedLibrary, 0, static_cast<int>(s_menu.library.size()) - 1);
+		const auto& cascadeRows = BuildCascadeRows();
+		const bool multipleRows = cascadeRows.size() > 1;
+		if (ImGui::IsMouseHoveringRect(railMin, railMax) && std::abs(ImGui::GetIO().MouseWheel) > 0.01f)
+		{
+			const int oldSelection = s_menu.selectedLibrary;
+			const int direction = ImGui::GetIO().MouseWheel < 0.0f ? 1 : -1;
+			if (multipleRows)
+			{
+				s_menu.selectedCascadeRow = std::clamp(s_menu.selectedCascadeRow + direction, 0,
+					static_cast<int>(cascadeRows.size()) - 1);
+				SelectCascadeRowCard(cascadeRows, s_menu.selectedCascadeRow);
+			}
+			else
+			{
+				const int count = static_cast<int>(s_menu.library.size());
+				s_menu.selectedLibrary = (s_menu.selectedLibrary + direction + count) % count;
+			}
+			s_menu.focus = FocusArea::Library;
+			UpdateSelectedAnimation(oldSelection);
+			PulseHaptics();
+		}
+		if (multipleRows)
+		{
+			DrawCascadeRows(draw, layout, cascadeRows);
+			return;
+		}
 
 
 		struct CarouselEntry
@@ -2526,16 +3617,17 @@ namespace
 			float focus{};
 			ArtworkTexture texture;
 		};
-		std::array<CarouselEntry, 15> visible{};
+		std::array<CarouselEntry, 19> visible{};
 		int visibleCount = 0;
 		const int count = static_cast<int>(s_menu.library.size());
 		const int requestedDensity = std::clamp<sint32>(
-			GetConfig().emulated_usb_devices.skylander_card_density.GetValue(), 5, 11);
+			GetConfig().emulated_usb_devices.skylander_card_density.GetValue(), 5, 15);
 		const int cardDensity = requestedDensity % 2 == 0 ? requestedDensity + 1 : requestedDensity;
+		const int layoutDensity = std::min(cardDensity, count);
 		const int cascadeStyle = std::clamp<sint32>(
 			GetConfig().emulated_usb_devices.skylander_cascade_style.GetValue(), 0, 3);
 		const int visibleRadius = cardDensity / 2;
-		std::array<int, 15> candidateIndices{};
+		std::array<int, 19> candidateIndices{};
 		int candidateCount = 0;
 		for (int relative = -visibleRadius - 1; relative <= visibleRadius + 1; ++relative)
 		{
@@ -2554,7 +3646,7 @@ namespace
 			else if (std::abs(existing->second - targetOffset) > visibleRadius + 1.0f)
 				existing->second = static_cast<float>(targetOffset);
 			existing->second = MotionEnabled() ?
-				SmoothTowards(existing->second, static_cast<float>(targetOffset), MotionLevel() == 2 ? 13.5f : 24.0f) :
+				SmoothTowards(existing->second, static_cast<float>(targetOffset), CarouselResponse()) :
 				static_cast<float>(targetOffset);
 			if (std::abs(targetOffset) > visibleRadius + 1 &&
 				std::abs(existing->second) > visibleRadius + 1.1f)
@@ -2585,31 +3677,33 @@ namespace
 			if (opacity <= 0.01f)
 				continue;
 			const bool selected = entry.index == s_menu.selectedLibrary;
-			const float magicPulse = MotionLevel() == 2 ?
-				0.5f + 0.5f * std::sin(time * 2.7f + entry.index * 0.21f) : 0.5f;
-			const float lift = entry.focus * (MotionLevel() == 2 ? 7.0f + magicPulse : 7.0f);
-			const float depthStep = cascadeStyle == 2 ? 7.0f : cascadeStyle == 3 ? 27.0f : 18.0f;
-			const float designHeight = 206.0f - std::min(distance, 4.0f) * depthStep + entry.focus * 7.0f;
-			const float cardSpacing = cardDensity == 5 ? 137.0f : cardDensity == 7 ? 105.0f :
-				cardDensity == 9 ? 82.0f : 68.0f;
-			const float cascadeDrop = cascadeStyle == 1 ? distance * 5.0f : cascadeStyle == 2 ? 0.0f :
-				cascadeStyle == 3 ? distance * 10.0f : distance * 7.0f;
+			const float magicPulse = AmbientMotionEnabled() ?
+				0.5f + 0.5f * std::sin(time * 1.18f * AmbientTempo() + entry.index * 0.21f) : 0.5f;
+			const float lift = entry.focus * (7.0f +
+				(magicPulse - 0.5f) * 1.4f * AmbientStrength());
+			const float depthStep = cascadeStyle == 2 ? 0.0f : cascadeStyle == 3 ? 12.0f :
+				cascadeStyle == 1 ? 2.0f : 4.0f;
+			const float designHeight = 182.0f - std::min(distance, 4.0f) * depthStep + entry.focus * 6.0f;
+			const float cardSpacing = layoutDensity <= 5 ? 142.0f : layoutDensity <= 7 ? 110.0f :
+				layoutDensity <= 9 ? 86.0f : layoutDensity <= 11 ? 72.0f : layoutDensity <= 13 ? 60.0f : 52.0f;
+			const float cascadeDrop = cascadeStyle == 1 ? distance * 2.0f : cascadeStyle == 2 ? 0.0f :
+				cascadeStyle == 3 ? distance * 5.0f : distance * distance * 1.7f;
 			const ImVec2 center = Point(layout, 790.0f + entry.offset * cardSpacing,
-				512.0f + cascadeDrop - lift);
+				493.0f + cascadeDrop - lift);
 			const float height = designHeight * layout.scale;
-			const int cardEffect = std::clamp<sint32>(
-				GetConfig().emulated_usb_devices.skylander_card_effect.GetValue(), 0, 3);
+			const int cardEffect = CardEffect();
 			if (entry.focus > 0.01f && cardEffect >= 1)
 			{
-				DrawGlow(draw, center, 132.0f * layout.scale, entry.texture.accent,
+				DrawGlow(draw, center, 116.0f * layout.scale, entry.texture.accent,
 					layout.alpha * entry.focus * (0.42f + magicPulse * 0.13f));
 				if (cardEffect >= 2)
-					DrawCardAura(draw, center, 111.0f * layout.scale, entry.texture.accent, entry.focus, layout.alpha);
+					DrawCardAura(draw, center, 98.0f * layout.scale, entry.texture.accent, entry.focus, layout.alpha);
 			}
-			const float fanTilt = entry.offset * (cascadeStyle == 1 ? 0.052f : cascadeStyle == 2 ? 0.0f :
-				cascadeStyle == 3 ? 0.018f : 0.034f);
-			const float focusTilt = MotionLevel() == 2 ?
-				entry.focus * std::sin(time * 1.45f + entry.index * 0.17f) * 0.013f : 0.0f;
+			const float fanTilt = entry.offset * (cascadeStyle == 1 ? 0.048f : cascadeStyle == 2 ? 0.0f :
+				cascadeStyle == 3 ? 0.012f : 0.025f);
+			const float focusTilt = AmbientMotionEnabled() ?
+				entry.focus * std::sin(time * 0.62f * AmbientTempo() + entry.index * 0.17f) *
+					0.006f * AmbientStrength() : 0.0f;
 			DrawCard(draw, entry.texture, center, height, fanTilt + focusTilt, entry.focus,
 				layout.alpha * opacity * (0.88f + entry.focus * 0.12f));
 			const float cardWidth = height * (entry.texture.id && entry.texture.size.y > 0 ?
@@ -2620,7 +3714,7 @@ namespace
 					center.y - height * 0.5f + 13.0f * layout.scale};
 				draw->AddCircleFilled(badge, 10.0f * layout.scale,
 					WithAlpha(IM_COL32(30, 24, 10, 240), layout.alpha * opacity), 24);
-				DrawStar(draw, badge, 6.8f * layout.scale,
+				DrawFavoriteIcon(draw, badge, 12.0f * layout.scale,
 					WithAlpha(IM_COL32(255, 209, 79, 255), layout.alpha * opacity));
 			}
 			const ImVec2 minimum{center.x - cardWidth * 0.58f, center.y - height * 0.58f};
@@ -2668,10 +3762,12 @@ namespace
 		const ImVec2 panelMax = Point(layout, 1262, 630);
 		DrawGlassPanel(draw, layout, panelMin, panelMax, 8.0f, true);
 		auto texture = GetArtworkTexture(s_menu.details.imagePath);
-		if (const auto* definition = s_menu.catalog.Find(s_menu.details.id, s_menu.details.variant))
+		const auto* definition = s_menu.catalog.Find(s_menu.details.id, s_menu.details.variant);
+		if (definition)
 			texture.accent = ElementColor(definition->element, texture.accent);
 		const ImVec2 cardCenter = Point(layout, 490, 390);
-		DrawGlow(draw, cardCenter, 164.0f * layout.scale, texture.accent, layout.alpha * 0.46f);
+		if (CardEffect() >= 1)
+			DrawGlow(draw, cardCenter, 164.0f * layout.scale, texture.accent, layout.alpha * 0.46f);
 		DrawCard(draw, texture, cardCenter, 310.0f * layout.scale,
 			std::sin(static_cast<float>(ImGui::GetTime()) * 1.3f) * 0.009f, true, layout.alpha);
 		DrawText(draw, Point(layout, 660, 207), WithAlpha(texture.accent, layout.alpha),
@@ -2696,18 +3792,25 @@ namespace
 			s_menu.details.actualSlot >= 0 ? fmt::format("SLOT {:02}", s_menu.details.actualSlot + 1) : "NOT ACTIVE");
 		if (s_menu.details.fromLibrary)
 		{
-			const bool favorite = IsFavorite(s_menu.details.filePath);
+			const std::string label = FigureLabel(s_menu.details.filePath);
+			const bool trap = definition && definition->type == skylander_ui::FigureType::Trap;
 			DrawText(draw, Point(layout, 660, 431), WithAlpha(CurrentTheme().muted, layout.alpha),
+				12.0f * layout.scale, trap ? "VILLAIN TAG" : "COLLECTION TAG");
+			DrawTextFit(draw, Point(layout, 812, 431),
+				WithAlpha(label.empty() ? CurrentTheme().muted : texture.accent, layout.alpha),
+				14.0f * layout.scale, DrawerWidth(layout, 390.0f), label.empty() ? "NOT SET" : label);
+			const bool favorite = IsFavorite(s_menu.details.filePath);
+			DrawText(draw, Point(layout, 660, 469), WithAlpha(CurrentTheme().muted, layout.alpha),
 				12.0f * layout.scale, "FAVORITE");
 			if (favorite)
-				DrawStar(draw, Point(layout, 820, 440), 8.0f * layout.scale,
+				DrawFavoriteIcon(draw, Point(layout, 820, 478), 14.0f * layout.scale,
 					WithAlpha(IM_COL32(255, 209, 79, 255), layout.alpha));
-			DrawText(draw, Point(layout, favorite ? 837 : 812, 431),
+			DrawText(draw, Point(layout, favorite ? 837 : 812, 469),
 				WithAlpha(favorite ? IM_COL32(255, 217, 111, 255) : IM_COL32(174, 199, 217, 255), layout.alpha),
 				14.0f * layout.scale, favorite ? "YES" : "NO");
-			DrawText(draw, Point(layout, 660, 481), WithAlpha(CurrentTheme().muted, layout.alpha),
+			DrawText(draw, Point(layout, 660, 507), WithAlpha(CurrentTheme().muted, layout.alpha),
 				12.0f * layout.scale, "FILE");
-			DrawTextFit(draw, Point(layout, 660, 505), WithAlpha(IM_COL32(207, 223, 235, 255), layout.alpha),
+			DrawTextFit(draw, Point(layout, 660, 531), WithAlpha(IM_COL32(207, 223, 235, 255), layout.alpha),
 				12.0f * layout.scale, DrawerWidth(layout, 540.0f), _pathToUtf8(s_menu.details.filePath.filename()));
 		}
 	}
@@ -2744,8 +3847,8 @@ namespace
 		const ImVec2 panelMin = Point(layout, 316, 142);
 		const ImVec2 panelMax = Point(layout, 1262, 630);
 		DrawGlassPanel(draw, layout, panelMin, panelMax, 8.0f, true);
-		DrawShadowedText(draw, Point(layout, 338, 162), WithAlpha(theme.text, layout.alpha),
-			23.0f * layout.scale, "CREATE A FIGURE", layout.scale);
+		DrawTitleText(draw, layout, Point(layout, 338, 163), 23.0f * layout.scale,
+			"CREATE A FIGURE");
 		const auto definitions = BuildForgeDefinitions();
 		if (!definitions.empty())
 			s_menu.selectedDefinition = std::clamp(s_menu.selectedDefinition, 0,
@@ -2756,34 +3859,52 @@ namespace
 		{
 			const auto& selected = *definitions[s_menu.selectedDefinition];
 			DrawTextFit(draw, Point(layout, 548, 166), WithAlpha(theme.text, layout.alpha),
-				17.0f * layout.scale, DrawerWidth(layout, 454.0f), selected.name);
+				17.0f * layout.scale, DrawerWidth(layout, 350.0f), selected.name);
 			DrawTextRightAligned(draw, Point(layout, 1238, 170),
 				WithAlpha(ElementColor(selected.element, theme.accent), layout.alpha),
-				10.5f * layout.scale, fmt::format("{}  /  {}", ElementName(selected.element),
-					FigureTypeName(selected.type)));
+				10.5f * layout.scale, fmt::format("{}  /  {}  /  {}", ElementName(selected.element),
+					FigureTypeName(selected.type), FigureGameName(selected.game)));
 		}
 
 		const ImVec2 searchMin = Point(layout, 338, 211);
-		const ImVec2 searchMax = Point(layout, 685, 253);
-		const ImVec2 sortMin = Point(layout, 697, 211);
-		const ImVec2 sortMax = Point(layout, 866, 253);
-		const ImVec2 typeMin = Point(layout, 878, 211);
-		const ImVec2 typeMax = Point(layout, 1056, 253);
-		const ImVec2 elementMin = Point(layout, 1068, 211);
-		const ImVec2 elementMax = Point(layout, 1238, 253);
-		const bool searchFocused = s_menu.forgeToolbarFocused && s_menu.forgeToolbarSelection == 0;
-		const bool sortFocused = s_menu.forgeToolbarFocused && s_menu.forgeToolbarSelection == 1;
-		const bool typeFocused = s_menu.forgeToolbarFocused && s_menu.forgeToolbarSelection == 2;
-		const bool elementFocused = s_menu.forgeToolbarFocused && s_menu.forgeToolbarSelection == 3;
-		DrawElevatedSurface(draw, layout, searchMin, searchMax, searchFocused || s_menu.forgeSearchText[0] != '\0');
-		DrawElevatedSurface(draw, layout, sortMin, sortMax, sortFocused || s_menu.forgeSortMode != 0);
-		DrawElevatedSurface(draw, layout, typeMin, typeMax, typeFocused || s_menu.forgeTypeFilter != 0);
-		DrawElevatedSurface(draw, layout, elementMin, elementMax, elementFocused || s_menu.forgeElementFilter != 0,
-			s_menu.forgeElementFilter == 0 ? theme.accent :
-				ElementColor(ElementForChoice(s_menu.forgeElementFilter), theme.accent));
+		const ImVec2 searchMax = Point(layout, 620, 253);
+		const ImVec2 sortMin = Point(layout, 630, 211);
+		const ImVec2 sortMax = Point(layout, 772, 253);
+		const ImVec2 typeMin = Point(layout, 782, 211);
+		const ImVec2 typeMax = Point(layout, 924, 253);
+		const ImVec2 elementMin = Point(layout, 934, 211);
+		const ImVec2 elementMax = Point(layout, 1086, 253);
+		const ImVec2 gameMin = Point(layout, 1096, 211);
+		const ImVec2 gameMax = Point(layout, 1238, 253);
+		const ImU32 sortAccent = BlendColor(IM_COL32(255, 190, 74, 255), theme.accent, 0.18f);
+		const ImU32 typeAccent = BlendColor(IM_COL32(183, 128, 255, 255), theme.accent, 0.18f);
+		const ImU32 elementAccent = s_menu.forgeElementFilter == 0 ?
+			BlendColor(IM_COL32(93, 225, 158, 255), theme.accent, 0.18f) :
+			ElementColor(ElementForChoice(s_menu.forgeElementFilter), theme.accent);
+		const ImU32 gameAccent = BlendColor(IM_COL32(255, 133, 91, 255), theme.accent, 0.18f);
+		const std::array<bool, 5> toolbarActive{
+			s_menu.forgeSearchText[0] != '\0', s_menu.forgeSortMode != 0, s_menu.forgeTypeFilter != 0,
+			s_menu.forgeElementFilter != 0, s_menu.forgeGameFilter != 0};
+		const std::array<ImU32, 5> toolbarAccents{theme.accent, sortAccent, typeAccent, elementAccent, gameAccent};
+		for (int index = 0; index < 5; ++index)
+		{
+			const bool focused = s_menu.forgeToolbarFocused && s_menu.forgeToolbarSelection == index;
+			s_menu.forgeToolbarFocusAnimations[index] = AnimateFocus(
+				s_menu.forgeToolbarFocusAnimations[index], focused ? 1.0f : 0.0f);
+		}
+		DrawAnimatedControlSurface(draw, layout, searchMin, searchMax,
+			s_menu.forgeToolbarFocusAnimations[0], toolbarActive[0], toolbarAccents[0]);
+		DrawAnimatedControlSurface(draw, layout, sortMin, sortMax,
+			s_menu.forgeToolbarFocusAnimations[1], toolbarActive[1], toolbarAccents[1]);
+		DrawAnimatedControlSurface(draw, layout, typeMin, typeMax,
+			s_menu.forgeToolbarFocusAnimations[2], toolbarActive[2], toolbarAccents[2]);
+		DrawAnimatedControlSurface(draw, layout, elementMin, elementMax,
+			s_menu.forgeToolbarFocusAnimations[3], toolbarActive[3], toolbarAccents[3]);
+		DrawAnimatedControlSurface(draw, layout, gameMin, gameMax,
+			s_menu.forgeToolbarFocusAnimations[4], toolbarActive[4], toolbarAccents[4]);
 		DrawSearchIcon(draw, layout, Point(layout, 359, 231));
 		ImGui::SetCursorScreenPos(Point(layout, 378, 215));
-		ImGui::SetNextItemWidth(DrawerWidth(layout, 294.0f));
+		ImGui::SetNextItemWidth(DrawerWidth(layout, 228.0f));
 		ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, {0, 7.0f * layout.scale});
 		ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(0, 0, 0, 0));
 		ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(0, 0, 0, 0));
@@ -2795,24 +3916,28 @@ namespace
 		if (ImGui::InputTextWithHint("##rift_create_search", "Search figures...",
 			s_menu.forgeSearchText.data(), s_menu.forgeSearchText.size()))
 			s_menu.selectedDefinition = 0;
+		if (ImGui::IsItemActive())
+			s_textInputTarget.store(static_cast<int>(SearchTarget::Create), std::memory_order_release);
 		if (searchFont)
 			ImGui::PopFont();
 		ImGui::PopStyleColor(4);
 		ImGui::PopStyleVar();
 		if (ClickedRect(layout, searchMin, searchMax))
-			s_menu.focus = FocusArea::Search;
-		if (ClickedRect(layout, searchMin, searchMax))
 		{
+			s_menu.focus = FocusArea::Search;
 			s_menu.forgeToolbarFocused = true;
 			s_menu.forgeToolbarSelection = 0;
 		}
-		DrawTextFit(draw, Point(layout, 712, 226), WithAlpha(theme.text, layout.alpha),
-			11.0f * layout.scale, DrawerWidth(layout, 142.0f), fmt::format("SORT  {}", ForgeSortName()));
-		DrawTextFit(draw, Point(layout, 892, 226), WithAlpha(theme.text, layout.alpha),
-			11.0f * layout.scale, DrawerWidth(layout, 151.0f), fmt::format("TYPE  {}", ForgeTypeFilterName()));
-		DrawTextFit(draw, Point(layout, 1082, 226), WithAlpha(theme.text, layout.alpha),
-			11.0f * layout.scale, DrawerWidth(layout, 143.0f),
+		DrawTextFit(draw, Point(layout, 643, 226), WithAlpha(theme.text, layout.alpha),
+			10.5f * layout.scale, DrawerWidth(layout, 116.0f), fmt::format("SORT  {}", ForgeSortName()));
+		DrawTextFit(draw, Point(layout, 795, 226), WithAlpha(theme.text, layout.alpha),
+			10.5f * layout.scale, DrawerWidth(layout, 116.0f), fmt::format("TYPE  {}", ForgeTypeFilterName()));
+		DrawTextFit(draw, Point(layout, 947, 226), WithAlpha(theme.text, layout.alpha),
+			10.5f * layout.scale, DrawerWidth(layout, 126.0f),
 			fmt::format("ELEMENT  {}", ElementChoiceName(s_menu.forgeElementFilter, "ALL")));
+		DrawTextFit(draw, Point(layout, 1109, 226), WithAlpha(theme.text, layout.alpha),
+			10.5f * layout.scale, DrawerWidth(layout, 116.0f),
+			fmt::format("GAME  {}", ForgeGameFilterName()));
 		if (ClickedRect(layout, sortMin, sortMax))
 		{
 			s_menu.forgeToolbarFocused = true;
@@ -2830,6 +3955,12 @@ namespace
 			s_menu.forgeToolbarFocused = true;
 			s_menu.forgeToolbarSelection = 3;
 			CycleForgeElementFilter();
+		}
+		if (ClickedRect(layout, gameMin, gameMax))
+		{
+			s_menu.forgeToolbarFocused = true;
+			s_menu.forgeToolbarSelection = 4;
+			CycleForgeGameFilter();
 		}
 
 		if (definitions.empty())
@@ -2862,16 +3993,17 @@ namespace
 				354.0f + row * 170.0f - focus * 10.0f);
 			auto texture = GetArtworkTexture(definition.imagePath);
 			texture.accent = ElementColor(definition.element, texture.accent);
-			if (focus > 0.01f)
+			if (focus > 0.01f && CardEffect() >= 1)
 				DrawGlow(draw, center, 102.0f * layout.scale, texture.accent, layout.alpha * focus * 0.50f);
 			DrawCard(draw, texture, center, (138.0f + focus * 16.0f) * layout.scale,
 				side * (1.0f - focus) * 0.012f, focus, layout.alpha * (0.80f + focus * 0.20f));
 			const ImVec2 minimum = Point(layout, 356.0f + column * 220.0f, 278.0f + row * 170.0f);
 			const ImVec2 maximum = Point(layout, 504.0f + column * 220.0f, 430.0f + row * 170.0f);
-			if (layout.alpha > 0.9f && ImGui::IsMouseHoveringRect(minimum, maximum) &&
+			if (s_menu.mouseNavigationActive && layout.alpha > 0.9f &&
+				ImGui::IsMouseHoveringRect(minimum, maximum) &&
 				index != s_menu.selectedDefinition)
 				s_menu.selectedDefinition = index;
-			if (ImGui::IsMouseHoveringRect(minimum, maximum))
+			if (s_menu.mouseNavigationActive && ImGui::IsMouseHoveringRect(minimum, maximum))
 				ImGui::SetTooltip("%s", definition.name.c_str());
 			if (ClickedRect(layout, minimum, maximum))
 			{
@@ -2891,18 +4023,97 @@ namespace
 		}
 	}
 
+	void OpenColorEditor()
+	{
+		auto& config = GetConfig().emulated_usb_devices;
+		const int theme = std::clamp<sint32>(config.skylander_theme.GetValue(), 0, 5);
+		const int accentIndex = std::clamp<sint32>(config.skylander_accent.GetValue(), 0, 6);
+		const ImU32 accent = ThemeAccentColor(theme, accentIndex);
+		ColorToHsv(accent, s_menu.colorEditorHsv[0]);
+		ColorToHsv(ThemeBaseColor(theme), s_menu.colorEditorHsv[1]);
+		for (int target = 0; target < 2; ++target)
+		{
+			const auto& hsv = s_menu.colorEditorHsv[target];
+			const float angle = hsv[0] * 2.0f * kPi - kPi * 0.5f;
+			s_menu.colorEditorCursor[target] = {
+				std::cos(angle) * hsv[1], std::sin(angle) * hsv[1]};
+		}
+		s_menu.colorEditorTarget = 0;
+		s_menu.colorEditorDirty = false;
+		s_menu.page = RiftPage::ColorEditor;
+		PulseHaptics(UiSound::Confirm);
+	}
+
+	void ApplyColorEditorValue()
+	{
+		auto& config = GetConfig().emulated_usb_devices;
+		auto& hsv = s_menu.colorEditorHsv[std::clamp(s_menu.colorEditorTarget, 0, 1)];
+		const uint32 color = ColorToConfig(HsvColor(hsv[0], hsv[1], hsv[2]));
+		if (s_menu.colorEditorTarget == 0)
+		{
+			config.skylander_custom_accent = color;
+			config.skylander_accent = 6;
+		}
+		else
+		{
+			config.skylander_custom_theme = color;
+			config.skylander_theme = 5;
+		}
+		s_menu.colorEditorDirty = true;
+	}
+
+	void MoveColorEditorCursor(float x, float y, bool pulse = true)
+	{
+		const int target = std::clamp(s_menu.colorEditorTarget, 0, 1);
+		auto& cursor = s_menu.colorEditorCursor[target];
+		cursor.x += x;
+		cursor.y += y;
+		float distance = std::sqrt(cursor.x * cursor.x + cursor.y * cursor.y);
+		if (distance > 1.0f)
+		{
+			cursor.x /= distance;
+			cursor.y /= distance;
+			distance = 1.0f;
+		}
+		auto& hsv = s_menu.colorEditorHsv[target];
+		hsv[1] = distance;
+		if (distance > 0.001f)
+			hsv[0] = std::fmod(std::atan2(cursor.y, cursor.x) / (2.0f * kPi) + 1.25f, 1.0f);
+		ApplyColorEditorValue();
+		if (pulse)
+			PulseHaptics();
+	}
+
+	void AdjustColorEditorBrightness(float value, bool pulse = true)
+	{
+		auto& hsv = s_menu.colorEditorHsv[std::clamp(s_menu.colorEditorTarget, 0, 1)];
+		hsv[2] = std::clamp(hsv[2] + value, 0.12f, 1.0f);
+		ApplyColorEditorValue();
+		if (pulse)
+			PulseHaptics();
+	}
+
+	void FinishColorEditor()
+	{
+		if (s_menu.colorEditorDirty)
+		{
+			g_config.Save();
+			s_menu.colorEditorDirty = false;
+			SetToast("CUSTOM COLORS SAVED", 1.8f);
+		}
+		s_menu.page = RiftPage::Options;
+	}
+
 	std::string OptionValue(int option)
 	{
 		auto& config = GetConfig().emulated_usb_devices;
 		switch (option)
 		{
 		case 0:
-			switch (std::clamp<sint32>(config.skylander_motion_level.GetValue(), 0, 2))
-			{
-			case 0: return "OFF";
-			case 1: return "REDUCED";
-			default: return "FULL";
-			}
+		{
+			static constexpr std::array names{"OFF", "REDUCED", "SMOOTH", "FLOATING", "CINEMATIC"};
+			return names[std::clamp<sint32>(config.skylander_motion_level.GetValue(), 0, 4)];
+		}
 		case 1:
 			switch (std::clamp<sint32>(config.skylander_bloom_level.GetValue(), 0, 2))
 			{
@@ -2915,55 +4126,57 @@ namespace
 		case 4: return config.skylander_ui_haptics.GetValue() ? "ON" : "OFF";
 		case 5:
 		{
-			const int density = std::clamp<sint32>(config.skylander_card_density.GetValue(), 5, 11);
+			const int density = std::clamp<sint32>(config.skylander_card_density.GetValue(), 5, 15);
 			return fmt::format("{} CARDS", density % 2 == 0 ? density + 1 : density);
 		}
 		case 6:
 		{
-			static constexpr std::array names{"CLASSIC", "DARK RIFT", "EMBER", "VERDANT", "ARCANE"};
-			return names[std::clamp<sint32>(config.skylander_theme.GetValue(), 0, 4)];
+			static constexpr std::array names{"CLASSIC", "DARK RIFT", "EMBER", "VERDANT", "ARCANE", "CUSTOM"};
+			return names[std::clamp<sint32>(config.skylander_theme.GetValue(), 0, 5)];
 		}
 		case 7:
 		{
-			static constexpr std::array names{"THEME", "CYAN", "VIOLET", "GOLD", "GREEN", "CORAL"};
-			return names[std::clamp<sint32>(config.skylander_accent.GetValue(), 0, 5)];
+			static constexpr std::array names{"THEME", "CYAN", "VIOLET", "GOLD", "GREEN", "CORAL", "CUSTOM"};
+			return names[std::clamp<sint32>(config.skylander_accent.GetValue(), 0, 6)];
 		}
-		case 8:
+		case 8: return "OPEN";
+		case 9:
 		{
 			static constexpr std::array names{"CLEAN", "GLOW", "RIFT", "FOIL"};
 			return names[std::clamp<sint32>(config.skylander_card_effect.GetValue(), 0, 3)];
 		}
-		case 9:
+		case 10:
 		{
 			static constexpr std::array names{"OFF", "LOW", "NORMAL", "HIGH"};
 			return names[std::clamp<sint32>(config.skylander_particle_level.GetValue(), 0, 3)];
 		}
-		case 10:
+		case 11:
 		{
 			static constexpr std::array names{"SOFT", "TACTILE", "ARCANE", "BRIGHT"};
 			return names[std::clamp<sint32>(config.skylander_sound_profile.GetValue(), 0, 3)];
 		}
-		case 11:
+		case 12:
 		{
 			static constexpr std::array names{"OFF", "SOFT", "MEDIUM", "STRONG"};
 			return names[std::clamp<sint32>(config.skylander_haptic_strength.GetValue(), 0, 3)];
 		}
-		case 12:
+		case 13:
 		{
 			static constexpr std::array names{"SQUARE", "SUBTLE", "ROUND"};
 			return names[std::clamp<sint32>(config.skylander_corner_style.GetValue(), 0, 2)];
 		}
-		case 13:
-		{
-			static constexpr std::array names{"MINIMAL", "ELEMENT", "ETCHED", "RUNES"};
-			return names[std::clamp<sint32>(config.skylander_card_border.GetValue(), 0, 3)];
-		}
 		case 14:
+		{
+			static constexpr std::array names{"CLEAN", "SUBTLE EDGE"};
+			return names[std::clamp<sint32>(config.skylander_card_border.GetValue(), 0, 1)];
+		}
+		case 15:
 		{
 			static constexpr std::array names{"ARC", "FAN", "FLAT", "DEPTH"};
 			return names[std::clamp<sint32>(config.skylander_cascade_style.GetValue(), 0, 3)];
 		}
-		case 15: return "CHECK NOW";
+		case 16: return GetConfig().check_update.GetValue() ? "ON" : "OFF";
+		case 17: return "CHECK NOW";
 		default: return {};
 		}
 	}
@@ -2978,6 +4191,9 @@ namespace
 	std::string LibraryOptionValue(int option)
 	{
 		auto& config = GetConfig().emulated_usb_devices;
+		const auto customRows = ParseCustomCascadeRows();
+		const int editorRow = std::clamp(s_menu.selectedCascadeEditorRow, 0,
+			static_cast<int>(customRows.size()) - 1);
 		switch (option)
 		{
 		case 0: return std::string(SortModeName());
@@ -2987,6 +4203,16 @@ namespace
 		case 3: return std::string(FilterModeName());
 		case 4: return std::string(ElementChoiceName(
 			std::clamp<sint32>(config.skylander_element_filter.GetValue(), 0, 11), "ALL ELEMENTS"));
+		case 5:
+		{
+			static constexpr std::array names{"SINGLE", "TOY TYPES", "GAMES", "CUSTOM"};
+			return names[std::clamp<sint32>(config.skylander_cascade_rows_layout.GetValue(), 0, 3)];
+		}
+		case 6: return fmt::format("{} ROWS", customRows.size());
+		case 7: return fmt::format("ROW {}", editorRow + 1);
+		case 8: return std::string(CascadeTypeName(customRows[editorRow].type));
+		case 9: return std::string(CascadeGameName(customRows[editorRow].game));
+		case 10: return std::string(ElementChoiceName(customRows[editorRow].element, "ALL ELEMENTS"));
 		default: return {};
 		}
 	}
@@ -3014,6 +4240,58 @@ namespace
 			config.skylander_element_filter = WrapChoice(
 				config.skylander_element_filter.GetValue() + direction, 12);
 			break;
+		case 5:
+			config.skylander_cascade_rows_layout = WrapChoice(
+				config.skylander_cascade_rows_layout.GetValue() + direction, 4);
+			s_menu.selectedCascadeRow = 0;
+			s_menu.cascadeRowPositions.fill(0);
+			s_menu.cascadeViewport = -1.0f;
+			s_cascadeCardOffsets.clear();
+			s_cascadeCardFocusAmounts.clear();
+			break;
+		case 6:
+		{
+			auto rows = ParseCustomCascadeRows();
+			const int count = 1 + WrapChoice(static_cast<int>(rows.size()) - 1 + direction,
+				kMaximumCascadeRows);
+			rows.resize(count);
+			SaveCustomCascadeRows(rows);
+			config.skylander_cascade_rows_layout = 3;
+			s_menu.selectedCascadeEditorRow = std::min(s_menu.selectedCascadeEditorRow, count - 1);
+			s_menu.selectedCascadeRow = 0;
+			s_menu.cascadeRowPositions.fill(0);
+			s_menu.cascadeViewport = -1.0f;
+			s_cascadeCardOffsets.clear();
+			s_cascadeCardFocusAmounts.clear();
+			break;
+		}
+		case 7:
+		{
+			const auto rows = ParseCustomCascadeRows();
+			s_menu.selectedCascadeEditorRow = WrapChoice(
+				s_menu.selectedCascadeEditorRow + direction, static_cast<int>(rows.size()));
+			break;
+		}
+		case 8:
+		case 9:
+		case 10:
+		{
+			auto rows = ParseCustomCascadeRows();
+			s_menu.selectedCascadeEditorRow = std::clamp(s_menu.selectedCascadeEditorRow, 0,
+				static_cast<int>(rows.size()) - 1);
+			auto& row = rows[s_menu.selectedCascadeEditorRow];
+			if (option == 8) row.type = WrapChoice(row.type + direction, 5);
+			if (option == 9) row.game = WrapChoice(row.game + direction, 7);
+			if (option == 10) row.element = WrapChoice(row.element + direction, 12);
+			SaveCustomCascadeRows(rows);
+			config.skylander_cascade_rows_layout = 3;
+			s_menu.selectedCascadeRow = 0;
+			s_menu.cascadeRowPositions.fill(0);
+			s_menu.cascadeViewport = -1.0f;
+			s_cascadeCardOffsets.clear();
+			s_cascadeCardFocusAmounts.clear();
+			break;
+		}
 		default: return;
 		}
 		g_config.Save();
@@ -3029,15 +4307,22 @@ namespace
 		switch (option)
 		{
 		case 0:
-			config.skylander_motion_level = WrapChoice(config.skylander_motion_level.GetValue() + direction, 3);
+			config.skylander_motion_level = WrapChoice(config.skylander_motion_level.GetValue() + direction, 5);
 			break;
 		case 1:
 			config.skylander_bloom_level = WrapChoice(config.skylander_bloom_level.GetValue() + direction, 3);
 			break;
 		case 2:
-			config.skylander_drawer_opacity = std::clamp<sint32>(
-				config.skylander_drawer_opacity.GetValue() + direction * 5, 40, 100);
+		{
+			int opacity = std::clamp<sint32>(config.skylander_drawer_opacity.GetValue(), 10, 100);
+			opacity = ((opacity + 2) / 5) * 5 - direction * 5;
+			if (opacity < 10)
+				opacity = 100;
+			else if (opacity > 100)
+				opacity = 10;
+			config.skylander_drawer_opacity = opacity;
 			break;
+		}
 		case 3:
 			config.skylander_ui_sound = !config.skylander_ui_sound.GetValue();
 			break;
@@ -3050,25 +4335,29 @@ namespace
 			break;
 		case 5:
 		{
-			const int density = std::clamp<sint32>(config.skylander_card_density.GetValue(), 5, 11);
-			const int densityIndex = std::clamp((density - 5) / 2, 0, 3);
-			config.skylander_card_density = 5 + WrapChoice(densityIndex + direction, 4) * 2;
+			const int density = std::clamp<sint32>(config.skylander_card_density.GetValue(), 5, 15);
+			const int densityIndex = std::clamp((density - 5) / 2, 0, 5);
+			config.skylander_card_density = 5 + WrapChoice(densityIndex + direction, 6) * 2;
 			break;
 		}
-		case 6: config.skylander_theme = WrapChoice(config.skylander_theme.GetValue() + direction, 5); break;
-		case 7: config.skylander_accent = WrapChoice(config.skylander_accent.GetValue() + direction, 6); break;
-		case 8: config.skylander_card_effect = WrapChoice(config.skylander_card_effect.GetValue() + direction, 4); break;
-		case 9: config.skylander_particle_level = WrapChoice(config.skylander_particle_level.GetValue() + direction, 4); break;
-		case 10: config.skylander_sound_profile = WrapChoice(config.skylander_sound_profile.GetValue() + direction, 4); break;
-		case 11:
+		case 6: config.skylander_theme = WrapChoice(config.skylander_theme.GetValue() + direction, 6); break;
+		case 7: config.skylander_accent = WrapChoice(config.skylander_accent.GetValue() + direction, 7); break;
+		case 8: OpenColorEditor(); return;
+		case 9: config.skylander_card_effect = WrapChoice(config.skylander_card_effect.GetValue() + direction, 4); break;
+		case 10: config.skylander_particle_level = WrapChoice(config.skylander_particle_level.GetValue() + direction, 4); break;
+		case 11: config.skylander_sound_profile = WrapChoice(config.skylander_sound_profile.GetValue() + direction, 4); break;
+		case 12:
 			config.skylander_haptic_strength = WrapChoice(config.skylander_haptic_strength.GetValue() + direction, 4);
 			config.skylander_ui_haptics = config.skylander_haptic_strength.GetValue() > 0;
 			if (!config.skylander_ui_haptics.GetValue()) StopMenuHaptics();
 			break;
-		case 12: config.skylander_corner_style = WrapChoice(config.skylander_corner_style.GetValue() + direction, 3); break;
-		case 13: config.skylander_card_border = WrapChoice(config.skylander_card_border.GetValue() + direction, 4); break;
-		case 14: config.skylander_cascade_style = WrapChoice(config.skylander_cascade_style.GetValue() + direction, 4); break;
-		case 15:
+		case 13: config.skylander_corner_style = WrapChoice(config.skylander_corner_style.GetValue() + direction, 3); break;
+		case 14: config.skylander_card_border = WrapChoice(config.skylander_card_border.GetValue() + direction, 2); break;
+		case 15: config.skylander_cascade_style = WrapChoice(config.skylander_cascade_style.GetValue() + direction, 4); break;
+		case 16:
+			GetConfig().check_update = !GetConfig().check_update.GetValue();
+			break;
+		case 17:
 			RequestUpdateCheck();
 			return;
 		default: return;
@@ -3088,62 +4377,50 @@ namespace
 		DrawGlassPanel(draw, layout, panelMin, panelMax, 8.0f, true);
 		DrawText(draw, Point(layout, 338, 164), WithAlpha(CurrentTheme().accent, layout.alpha),
 			12.0f * layout.scale, "RIFT SETTINGS");
-		DrawText(draw, Point(layout, 337, 188), WithAlpha(CurrentTheme().text, layout.alpha),
-			24.0f * layout.scale, "DISPLAY, FEEDBACK & UPDATES");
+		DrawTitleText(draw, layout, Point(layout, 337, 188), 24.0f * layout.scale,
+			"DISPLAY, FEEDBACK & UPDATES");
 		DrawText(draw, Point(layout, 337, 222), WithAlpha(CurrentTheme().muted, layout.alpha),
 			12.0f * layout.scale, "USE THE D-PAD TO CHOOSE. PRESS A TO CHANGE THE SELECTED OPTION.");
 
 		const std::array<std::pair<std::string_view, std::string_view>, kOptionCount> rows{{
-			{"MOTION", "Opening, card lift and magical movement"},
+			{"MOTION", "Five speeds for drawer, rows, card lift, and shimmer"},
 			{"BLOOM", "Portal and selected-card light"},
-			{"GLASS OPACITY", "How much of the game shows through"},
+			{"GLASS OPACITY", "Press A to lower it; wraps after 10%"},
 			{"UI SOUND", "Navigation and confirmation clicks"},
 			{"CONTROLLER HAPTICS", "Short focus and action pulses"},
 			{"CARD CASCADE", "Visible library density"},
 			{"COLOR SCHEME", "Complete Rift palette"},
 			{"ACCENT COLOR", "Highlight and portal glow"},
+			{"CUSTOM COLORS", "Choose exact theme and accent colors"},
 			{"CARD EFFECT", "Clean, glow, rift, or foil"},
 			{"PARTICLES", "Ambient magical texture"},
 			{"SOUND PROFILE", "Soft through bright tactile clicks"},
 			{"HAPTIC STRENGTH", "Off through strong feedback"},
-			{"CORNERS", "Square, subtle, or round panels"},
-			{"CARD BORDER", "Element edge, etched frame, or runes"},
+			{"CARD & PANEL CORNERS", "Square, subtle, or round edges"},
+			{"CARD BORDER", "Clean or a subtle element edge"},
 			{"CASCADE SHAPE", "Arc, fan, flat, or deep stack"},
+			{"AUTO UPDATE CHECK", "Check quietly whenever Rift starts"},
 			{"CHECK FOR UPDATES", "Compare this build with the latest GitHub release"}}};
 		for (int option = 0; option < static_cast<int>(rows.size()); ++option)
 		{
-			const int column = option / 8;
-			const int row = option % 8;
+			const int column = option / 9;
+			const int row = option % 9;
 			const float x = 338.0f + column * 454.0f;
-			const float y = 249.0f + row * 43.0f;
+			const float y = 248.0f + row * 41.0f;
 			const ImVec2 minimum = Point(layout, x, y);
-			const ImVec2 maximum = Point(layout, x + 440.0f, y + 36.0f);
+			const ImVec2 maximum = Point(layout, x + 440.0f, y + 35.0f);
 			const bool selected = option == s_menu.selectedOption;
 			float& focusAnimation = s_menu.optionFocusAnimations[option];
 			focusAnimation = AnimateFocus(focusAnimation, selected ? 1.0f : 0.0f);
-			draw->AddRectFilled(minimum, maximum, WithAlpha(CurrentTheme().surface, layout.alpha * 0.52f), CornerRadius(4.0f) * layout.scale);
-			if (focusAnimation > 0.01f)
-			{
-				draw->AddRectFilled({minimum.x + 4.0f * layout.scale, minimum.y + 6.0f * layout.scale},
-					{maximum.x + 4.0f * layout.scale, maximum.y + 6.0f * layout.scale},
-					WithAlpha(IM_COL32(0, 2, 10, 255), layout.alpha * focusAnimation * 0.30f),
-					4.0f * layout.scale);
-				draw->AddRectFilled(minimum, maximum,
-					WithAlpha(CurrentTheme().selectedSurface, layout.alpha * focusAnimation * 0.86f),
-					4.0f * layout.scale);
-			}
-			draw->AddRect(minimum, maximum,
-				WithAlpha(BlendColor(CurrentTheme().border, CurrentTheme().accent, focusAnimation),
-					layout.alpha * (0.20f + focusAnimation * 0.56f)), 4.0f * layout.scale, 0,
-				(1.0f + focusAnimation * 0.8f) * layout.scale);
-			DrawText(draw, Point(layout, x + 12.0f, y + 3.0f),
+			DrawSettingsChoiceSurface(draw, layout, minimum, maximum, focusAnimation);
+			DrawText(draw, Point(layout, x + 12.0f, y + 2.5f),
 				WithAlpha(BlendColor(Lighten(CurrentTheme().muted, 0.15f), CurrentTheme().text, focusAnimation), layout.alpha),
 				11.5f * layout.scale, rows[option].first);
-			DrawTextFit(draw, Point(layout, x + 12.0f, y + 19.0f), WithAlpha(CurrentTheme().muted, layout.alpha),
+			DrawTextFit(draw, Point(layout, x + 12.0f, y + 18.5f), WithAlpha(CurrentTheme().muted, layout.alpha),
 				8.8f * layout.scale, DrawerWidth(layout, 290.0f), rows[option].second);
-			DrawTextFit(draw, Point(layout, x + 318.0f, y + 9.0f),
+			DrawTextCentered(draw, Point(layout, x + 372.0f, y + 17.5f),
 				WithAlpha(BlendColor(CurrentTheme().text, CurrentTheme().accent, focusAnimation), layout.alpha),
-				11.5f * layout.scale, DrawerWidth(layout, 108.0f), OptionValue(option));
+				11.5f * layout.scale, OptionValue(option));
 			if (ClickedRect(layout, minimum, maximum))
 			{
 				if (s_menu.selectedOption == option)
@@ -3157,58 +4434,193 @@ namespace
 		}
 	}
 
+	void DrawColorEditorPage(ImDrawList* draw, const RiftLayout& layout)
+	{
+		DrawHeader(draw, layout);
+		const auto theme = CurrentTheme();
+		const ImVec2 panelMin = Point(layout, 316, 142);
+		const ImVec2 panelMax = Point(layout, 1262, 630);
+		DrawGlassPanel(draw, layout, panelMin, panelMax, 8.0f, true);
+		DrawText(draw, Point(layout, 338, 164), WithAlpha(theme.accent, layout.alpha),
+			12.0f * layout.scale, "COLORS");
+		DrawTitleText(draw, layout, Point(layout, 337, 188), 24.0f * layout.scale,
+			"CUSTOM PALETTE");
+		DrawText(draw, Point(layout, 337, 222), WithAlpha(theme.muted, layout.alpha),
+			12.0f * layout.scale, "D-PAD OR LEFT STICK TO MOVE THE CURSOR");
+
+		const std::array<std::string_view, 2> targetNames{"ACCENT", "THEME BASE"};
+		for (int target = 0; target < 2; ++target)
+		{
+			const float x = 810.0f + target * 205.0f;
+			const ImVec2 minimum = Point(layout, x, 266);
+			const ImVec2 maximum = Point(layout, x + 188.0f, 310);
+			const bool selected = s_menu.colorEditorTarget == target;
+			DrawSettingsChoiceSurface(draw, layout, minimum, maximum, selected ? 1.0f : 0.0f);
+			DrawTextCentered(draw, Point(layout, x + 94.0f, 288),
+				WithAlpha(selected ? theme.text : theme.muted, layout.alpha),
+				12.0f * layout.scale, targetNames[target]);
+			if (ClickedRect(layout, minimum, maximum))
+			{
+				s_menu.colorEditorTarget = target;
+				PulseHaptics();
+			}
+		}
+
+		auto& hsv = s_menu.colorEditorHsv[std::clamp(s_menu.colorEditorTarget, 0, 1)];
+		const ImVec2 wheelCenter = Point(layout, 570, 397);
+		const float wheelRadius = 124.0f * layout.scale;
+		constexpr int wheelSegments = 48;
+		constexpr int wheelRings = 8;
+		for (int ring = 0; ring < wheelRings; ++ring)
+		{
+			const float innerRadius = wheelRadius * static_cast<float>(ring) / wheelRings;
+			const float outerRadius = wheelRadius * static_cast<float>(ring + 1) / wheelRings;
+			const float innerSaturation = static_cast<float>(ring) / wheelRings;
+			const float outerSaturation = static_cast<float>(ring + 1) / wheelRings;
+			for (int segment = 0; segment < wheelSegments; ++segment)
+			{
+				const float hue0 = static_cast<float>(segment) / wheelSegments;
+				const float hue1 = static_cast<float>(segment + 1) / wheelSegments;
+				const float angle0 = static_cast<float>(segment) / wheelSegments * 2.0f * kPi - kPi * 0.5f;
+				const float angle1 = static_cast<float>(segment + 1) / wheelSegments * 2.0f * kPi - kPi * 0.5f;
+				const ImVec2 inner0{wheelCenter.x + std::cos(angle0) * innerRadius,
+					wheelCenter.y + std::sin(angle0) * innerRadius};
+				const ImVec2 outer0{wheelCenter.x + std::cos(angle0) * outerRadius,
+					wheelCenter.y + std::sin(angle0) * outerRadius};
+				const ImVec2 outer1{wheelCenter.x + std::cos(angle1) * outerRadius,
+					wheelCenter.y + std::sin(angle1) * outerRadius};
+				const ImVec2 inner1{wheelCenter.x + std::cos(angle1) * innerRadius,
+					wheelCenter.y + std::sin(angle1) * innerRadius};
+				DrawGradientQuad(draw, inner0, outer0, outer1, inner1,
+					WithAlpha(HsvColor(hue0, innerSaturation, hsv[2]), layout.alpha),
+					WithAlpha(HsvColor(hue0, outerSaturation, hsv[2]), layout.alpha),
+					WithAlpha(HsvColor(hue1, outerSaturation, hsv[2]), layout.alpha),
+					WithAlpha(HsvColor(hue1, innerSaturation, hsv[2]), layout.alpha));
+			}
+		}
+		draw->AddCircle(wheelCenter, wheelRadius, WithAlpha(theme.border, layout.alpha * 0.78f),
+			wheelSegments, 2.0f * layout.scale);
+		const ImVec2 cursor = s_menu.colorEditorCursor[std::clamp(s_menu.colorEditorTarget, 0, 1)];
+		const ImVec2 marker{wheelCenter.x + cursor.x * wheelRadius,
+			wheelCenter.y + cursor.y * wheelRadius};
+		draw->AddCircleFilled(marker, 8.0f * layout.scale, WithAlpha(IM_COL32(0, 3, 10, 255), layout.alpha), 20);
+		draw->AddCircle(marker, 6.0f * layout.scale, WithAlpha(IM_COL32_WHITE, layout.alpha), 20,
+			2.0f * layout.scale);
+
+		const ImVec2 valueMin{wheelCenter.x - wheelRadius, Point(layout, 570, 548).y};
+		const ImVec2 valueMax{wheelCenter.x + wheelRadius, Point(layout, 570, 572).y};
+		const ImU32 fullValue = HsvColor(hsv[0], hsv[1], 1.0f);
+		draw->AddRectFilledMultiColor(valueMin, valueMax,
+			WithAlpha(IM_COL32(8, 8, 10, 255), layout.alpha), WithAlpha(fullValue, layout.alpha),
+			WithAlpha(fullValue, layout.alpha), WithAlpha(IM_COL32(8, 8, 10, 255), layout.alpha));
+		draw->AddRect(valueMin, valueMax, WithAlpha(theme.border, layout.alpha * 0.72f),
+			CornerRadius(3.0f) * layout.scale, 0, 1.5f * layout.scale);
+		const float valueX = valueMin.x + (valueMax.x - valueMin.x) * hsv[2];
+		draw->AddLine({valueX, valueMin.y - 3.0f * layout.scale},
+			{valueX, valueMax.y + 3.0f * layout.scale}, WithAlpha(IM_COL32_WHITE, layout.alpha),
+			2.0f * layout.scale);
+		DrawTextCentered(draw, Point(layout, 570, 591), WithAlpha(theme.muted, layout.alpha),
+			10.0f * layout.scale, "X / Y  BRIGHTNESS");
+
+		const ImU32 selectedColor = HsvColor(hsv[0], hsv[1], hsv[2]);
+		const ImU32 previewText = ContrastingTextColor(selectedColor);
+		const ImU32 previewShadow = ContrastingTextColor(previewText);
+		const ImVec2 previewMin = Point(layout, 810, 342);
+		const ImVec2 previewMax = Point(layout, 1203, 448);
+		draw->AddRectFilled({previewMin.x + 5.0f * layout.scale, previewMin.y + 7.0f * layout.scale},
+			{previewMax.x + 5.0f * layout.scale, previewMax.y + 7.0f * layout.scale},
+			WithAlpha(IM_COL32(0, 2, 9, 255), layout.alpha * 0.34f), CornerRadius(7.0f) * layout.scale);
+		draw->AddRectFilled(previewMin, previewMax, WithAlpha(selectedColor, layout.alpha),
+			CornerRadius(7.0f) * layout.scale);
+		draw->AddRect(previewMin, previewMax, WithAlpha(Lighten(selectedColor, 0.44f), layout.alpha * 0.82f),
+			CornerRadius(7.0f) * layout.scale, 0, 2.0f * layout.scale);
+		DrawText(draw, Point(layout, 833.5f, 366.5f), WithAlpha(previewShadow, layout.alpha * 0.28f),
+			12.0f * layout.scale, targetNames[s_menu.colorEditorTarget]);
+		DrawText(draw, Point(layout, 832, 365), WithAlpha(previewText, layout.alpha),
+			12.0f * layout.scale, targetNames[s_menu.colorEditorTarget]);
+		DrawText(draw, Point(layout, 834.0f, 399.0f), WithAlpha(previewShadow, layout.alpha * 0.28f),
+			22.0f * layout.scale, fmt::format("#{:06X}", ColorToConfig(selectedColor)));
+		DrawText(draw, Point(layout, 832, 397), WithAlpha(previewText, layout.alpha),
+			22.0f * layout.scale, fmt::format("#{:06X}", ColorToConfig(selectedColor)));
+		DrawText(draw, Point(layout, 810, 486), WithAlpha(theme.text, layout.alpha),
+			12.0f * layout.scale, "LB / RB  ACCENT / THEME");
+		DrawText(draw, Point(layout, 810, 513), WithAlpha(theme.muted, layout.alpha),
+			10.5f * layout.scale, "PRESETS ARE STILL AVAILABLE.");
+
+		const bool pointerActive = layout.alpha > 0.9f && ImGui::IsMouseDown(0);
+		if (pointerActive)
+		{
+			const ImVec2 mouse = ImGui::GetIO().MousePos;
+			const float dx = mouse.x - wheelCenter.x;
+			const float dy = mouse.y - wheelCenter.y;
+			const float distance = std::sqrt(dx * dx + dy * dy);
+			if (distance <= wheelRadius)
+			{
+				auto& activeCursor = s_menu.colorEditorCursor[
+					std::clamp(s_menu.colorEditorTarget, 0, 1)];
+				activeCursor = {dx / wheelRadius, dy / wheelRadius};
+				MoveColorEditorCursor(0.0f, 0.0f, false);
+				if (ImGui::IsMouseClicked(0))
+					PulseHaptics();
+			}
+			else if (ImGui::IsMouseHoveringRect(valueMin, valueMax))
+			{
+				hsv[2] = std::clamp((mouse.x - valueMin.x) / (valueMax.x - valueMin.x), 0.12f, 1.0f);
+				ApplyColorEditorValue();
+				if (ImGui::IsMouseClicked(0))
+					PulseHaptics();
+			}
+		}
+	}
+
 	void DrawLibraryOrderPage(ImDrawList* draw, const RiftLayout& layout)
 	{
+		const auto theme = CurrentTheme();
 		DrawHeader(draw, layout);
 		const ImVec2 panelMin = Point(layout, 316, 142);
 		const ImVec2 panelMax = Point(layout, 1262, 630);
 		DrawGlassPanel(draw, layout, panelMin, panelMax, 8.0f, true);
 		DrawText(draw, Point(layout, 338, 164), WithAlpha(CurrentTheme().accent, layout.alpha),
 			12.0f * layout.scale, "LIBRARY ORDER");
-		DrawText(draw, Point(layout, 337, 188), WithAlpha(CurrentTheme().text, layout.alpha),
-			24.0f * layout.scale, "PUT THE NEXT FIGURE ONE MOVE AWAY");
+		DrawTitleText(draw, layout, Point(layout, 337, 188), 24.0f * layout.scale,
+			"PUT THE NEXT FIGURE ONE MOVE AWAY");
 		DrawText(draw, Point(layout, 337, 222), WithAlpha(CurrentTheme().muted, layout.alpha),
 			12.0f * layout.scale, "SORT, PIN, OR NARROW THE CASCADE WITHOUT LEAVING THE GAME.");
 		DrawText(draw, Point(layout, 1158, 188), WithAlpha(CurrentTheme().accent, layout.alpha),
 			13.0f * layout.scale, fmt::format("{} MATCH", s_menu.library.size()));
 
-		const std::array<std::pair<std::string_view, std::string_view>, 5> rows{{
+		const std::array<std::pair<std::string_view, std::string_view>, kLibraryOptionCount> rows{{
 			{"SORT BY", "Base order inside the card cascade"},
 			{"PIN FIRST", "Favorites, traps, figures, or items"},
 			{"ELEMENT FIRST", "Bring one element to the front"},
 			{"SHOW", "Limit the library by figure family"},
-			{"ELEMENT FILTER", "Show only one element"}}};
+			{"ELEMENT FILTER", "Show only one element"},
+			{"ROW PRESET", "Single, toy types, games, or custom"},
+			{"CUSTOM ROW COUNT", "Configure between one and six rows"},
+			{"EDIT CUSTOM ROW", "Choose the row changed below"},
+			{"ROW FIGURE TYPE", "All figures, Skylanders, traps, or gear"},
+			{"ROW GAME", "Show figures from one game in this row"},
+			{"ROW ELEMENT", "Optionally narrow this row by element"}}};
 		for (int option = 0; option < static_cast<int>(rows.size()); ++option)
 		{
-			const float y = 264.0f + option * 62.0f;
-			const ImVec2 minimum = Point(layout, 338, y);
-			const ImVec2 maximum = Point(layout, 1238, y + 51.0f);
+			const int column = option / 6;
+			const int row = option % 6;
+			const float x = 338.0f + column * 454.0f;
+			const float y = 264.0f + row * 52.0f;
+			const ImVec2 minimum = Point(layout, x, y);
+			const ImVec2 maximum = Point(layout, x + 440.0f, y + 44.0f);
 			const bool selected = option == s_menu.selectedLibraryOption;
 			float& focusAnimation = s_menu.libraryOptionFocusAnimations[option];
 			focusAnimation = AnimateFocus(focusAnimation, selected ? 1.0f : 0.0f);
-			draw->AddRectFilled(minimum, maximum, WithAlpha(CurrentTheme().surface, layout.alpha * 0.52f), CornerRadius(4.0f) * layout.scale);
-			if (focusAnimation > 0.01f)
-			{
-				draw->AddRectFilled({minimum.x + 5.0f * layout.scale, minimum.y + 7.0f * layout.scale},
-					{maximum.x + 5.0f * layout.scale, maximum.y + 7.0f * layout.scale},
-					WithAlpha(IM_COL32(0, 2, 10, 255), layout.alpha * focusAnimation * 0.32f),
-					4.0f * layout.scale);
-				draw->AddRectFilled(minimum, maximum,
-					WithAlpha(CurrentTheme().selectedSurface, layout.alpha * focusAnimation * 0.88f),
-					4.0f * layout.scale);
-			}
-			draw->AddRect(minimum, maximum,
-				WithAlpha(BlendColor(CurrentTheme().border, CurrentTheme().accent, focusAnimation),
-					layout.alpha * (0.20f + focusAnimation * 0.56f)), 4.0f * layout.scale, 0,
-				(1.0f + focusAnimation * 0.8f) * layout.scale);
-			DrawText(draw, Point(layout, 355, y + 9.0f),
-				WithAlpha(selected ? IM_COL32(235, 248, 255, 255) : IM_COL32(211, 227, 238, 255), layout.alpha),
-				13.0f * layout.scale, rows[option].first);
-			DrawText(draw, Point(layout, 555, y + 9.0f), WithAlpha(IM_COL32(132, 167, 191, 255), layout.alpha),
-				11.5f * layout.scale, rows[option].second);
-			DrawTextFit(draw, Point(layout, 1058, y + 9.0f),
-				WithAlpha(selected ? CurrentTheme().accent : IM_COL32(226, 238, 246, 255), layout.alpha),
-				13.0f * layout.scale, DrawerWidth(layout, 160.0f), LibraryOptionValue(option));
+			DrawSettingsChoiceSurface(draw, layout, minimum, maximum, focusAnimation);
+			DrawText(draw, Point(layout, x + 12.0f, y + 5.0f),
+				WithAlpha(selected ? theme.text : BlendColor(theme.muted, theme.text, 0.40f), layout.alpha),
+				11.5f * layout.scale, rows[option].first);
+			DrawTextFit(draw, Point(layout, x + 12.0f, y + 23.0f), WithAlpha(theme.muted, layout.alpha),
+				8.6f * layout.scale, DrawerWidth(layout, 285.0f), rows[option].second);
+			DrawTextFit(draw, Point(layout, x + 304.0f, y + 13.0f),
+				WithAlpha(selected ? theme.accent : theme.text, layout.alpha),
+				11.0f * layout.scale, DrawerWidth(layout, 122.0f), LibraryOptionValue(option));
 			if (ClickedRect(layout, minimum, maximum))
 			{
 				if (s_menu.selectedLibraryOption == option)
@@ -3381,12 +4793,14 @@ namespace
 			if (s_menu.details.fromLibrary)
 				DrawActionHint(draw, layout, 318, "A", "PLACE");
 			if (s_menu.details.fromLibrary)
-				DrawActionHint(draw, layout, 430, "X", "DELETE FILE");
+				DrawActionHint(draw, layout, 430, "Y", "EDIT TAG");
+			if (s_menu.details.fromLibrary)
+				DrawActionHint(draw, layout, 560, "X", "DELETE FILE");
 			else if (s_menu.details.actualSlot >= 0)
 				DrawActionHint(draw, layout, 430, "X", "REMOVE");
 			if (s_menu.details.fromLibrary)
-				DrawActionHint(draw, layout, 560, "RB", "FAVORITE");
-			DrawActionHint(draw, layout, 700, "B", "BACK");
+				DrawActionHint(draw, layout, 720, "RB", "FAVORITE");
+			DrawActionHint(draw, layout, s_menu.details.fromLibrary ? 865.0f : 570.0f, "B", "BACK");
 			if (FooterClicked(layout, 310, 420) && s_menu.details.fromLibrary)
 			{
 				const auto* definition = s_menu.catalog.Find(s_menu.details.id, s_menu.details.variant);
@@ -3395,16 +4809,20 @@ namespace
 					definition ? definition->element : skylander_ui::FigureElement::Unknown,
 					definition ? definition->type : skylander_ui::FigureType::Unknown});
 			}
-			else if (FooterClicked(layout, 422, 535))
+			else if (FooterClicked(layout, 422, 545) && s_menu.details.fromLibrary)
+				OpenLabelKeyboard();
+			else if (FooterClicked(layout, s_menu.details.fromLibrary ? 547.0f : 422.0f,
+				s_menu.details.fromLibrary ? 705.0f : 535.0f))
 			{
 				if (s_menu.details.fromLibrary)
 					RequestDeleteDetailFigure();
 				else if (s_menu.details.actualSlot >= 0)
 					RemoveActualSlot(s_menu.details.actualSlot);
 			}
-			else if (FooterClicked(layout, 552, 680) && s_menu.details.fromLibrary)
+			else if (FooterClicked(layout, 707, 850) && s_menu.details.fromLibrary)
 				ToggleFavoritePath(s_menu.details.filePath, s_menu.details.name);
-			else if (FooterClicked(layout, 690, 815))
+			else if (FooterClicked(layout, s_menu.details.fromLibrary ? 852.0f : 562.0f,
+				s_menu.details.fromLibrary ? 960.0f : 685.0f))
 			{
 				s_menu.page = RiftPage::Dashboard;
 				s_menu.focus = FocusArea::Library;
@@ -3420,6 +4838,39 @@ namespace
 			else if (FooterClicked(layout, 500, 640))
 			{
 				s_menu.page = RiftPage::Details;
+				PulseHaptics(UiSound::Back);
+			}
+		}
+		else if (s_menu.page == RiftPage::ColorEditor)
+		{
+			DrawActionHint(draw, layout, 318, "A", "DONE");
+			DrawActionHint(draw, layout, 420, "X", "DARKER");
+			DrawActionHint(draw, layout, 538, "Y", "BRIGHTER");
+			DrawActionHint(draw, layout, 670, "LB", "ACCENT");
+			DrawActionHint(draw, layout, 790, "RB", "THEME");
+			DrawActionHint(draw, layout, 905, "B", "BACK");
+			if (FooterClicked(layout, 310, 410))
+			{
+				FinishColorEditor();
+				PulseHaptics(UiSound::Confirm);
+			}
+			else if (FooterClicked(layout, 412, 528))
+				AdjustColorEditorBrightness(-0.035f);
+			else if (FooterClicked(layout, 530, 660))
+				AdjustColorEditorBrightness(0.035f);
+			else if (FooterClicked(layout, 662, 780))
+			{
+				s_menu.colorEditorTarget = 0;
+				PulseHaptics();
+			}
+			else if (FooterClicked(layout, 782, 895))
+			{
+				s_menu.colorEditorTarget = 1;
+				PulseHaptics();
+			}
+			else if (FooterClicked(layout, 897, 1015))
+			{
+				FinishColorEditor();
 				PulseHaptics(UiSound::Back);
 			}
 		}
@@ -3441,8 +4892,10 @@ namespace
 					CycleForgeSort();
 				else if (s_menu.forgeToolbarSelection == 2)
 					CycleForgeTypeFilter();
-				else
+				else if (s_menu.forgeToolbarSelection == 3)
 					CycleForgeElementFilter();
+				else
+					CycleForgeGameFilter();
 			}
 			else if (FooterClicked(layout, 458, 585))
 			{
@@ -3524,6 +4977,7 @@ namespace
 	{
 		if (s_menu.toastLife <= 0.0f || s_menu.toast.empty())
 			return;
+		const auto theme = CurrentTheme();
 		const float fade = Clamp01(s_menu.toastLife * 2.0f);
 		ImFont* font = ImGui_GetFont(14.0f * layout.scale);
 		if (!font)
@@ -3537,12 +4991,18 @@ namespace
 		draw->AddRectFilled({minimum.x + DrawerWidth(layout, 5.0f), minimum.y + 7.0f * layout.scale},
 			{maximum.x + DrawerWidth(layout, 5.0f), maximum.y + 7.0f * layout.scale},
 			WithAlpha(IM_COL32(0, 2, 10, 255), layout.alpha * fade * 0.42f), 9.0f * layout.scale);
-		draw->AddRectFilled(minimum, maximum, WithAlpha(IM_COL32(6, 18, 34, 242), layout.alpha * fade),
+		draw->AddRectFilled(minimum, maximum,
+			WithAlpha(BlendColor(theme.background, theme.surface, 0.72f), layout.alpha * fade * 0.96f),
 			9.0f * layout.scale);
-		draw->AddRect(minimum, maximum, WithAlpha(IM_COL32(97, 214, 255, 255), layout.alpha * fade * 0.64f),
+		draw->AddRectFilled({minimum.x + DrawerWidth(layout, 3.0f), minimum.y + 9.0f * layout.scale},
+			{minimum.x + DrawerWidth(layout, 6.0f), maximum.y - 9.0f * layout.scale},
+			WithAlpha(theme.accent, layout.alpha * fade * 0.82f), 2.0f * layout.scale);
+		draw->AddCircleFilled({minimum.x + DrawerWidth(layout, 15.0f), center.y}, 2.6f * layout.scale,
+			WithAlpha(theme.secondary, layout.alpha * fade * 0.86f), 12);
+		draw->AddRect(minimum, maximum, WithAlpha(theme.border, layout.alpha * fade * 0.72f),
 			9.0f * layout.scale, 0, 1.2f * layout.scale);
 		DrawTextFit(draw, {minimum.x + DrawerWidth(layout, 22.0f), center.y - 8.0f * layout.scale},
-			WithAlpha(IM_COL32(238, 247, 252, 255), layout.alpha * fade),
+			WithAlpha(theme.text, layout.alpha * fade),
 			14.0f * layout.scale, width - DrawerWidth(layout, 44.0f), s_menu.toast);
 	}
 
@@ -3550,27 +5010,37 @@ namespace
 	{
 		if (s_menu.searchTarget == SearchTarget::None)
 			return;
+		s_menu.keyboardVisibility = AnimateFocus(s_menu.keyboardVisibility, 1.0f);
+		RiftLayout keyboardLayout = layout;
+		keyboardLayout.alpha *= Clamp01(s_menu.keyboardVisibility);
+		keyboardLayout.origin.y += (1.0f - EaseOutCubic(s_menu.keyboardVisibility)) * 18.0f * layout.scale;
 		const auto theme = CurrentTheme();
 		draw->AddRectFilled(Point(layout, kDrawerX, 0), Point(layout, 1280, 720),
-			WithAlpha(IM_COL32(0, 2, 9, 255), layout.alpha * 0.68f));
-		const ImVec2 panelMin = Point(layout, 376, 142);
-		const ImVec2 panelMax = Point(layout, 1248, 620);
-		DrawGlassPanel(draw, layout, panelMin, panelMax, 9.0f, true);
-		const std::string_view title = s_menu.searchTarget == SearchTarget::Create ?
-			"SEARCH FIGURES" : "SEARCH COLLECTION";
-		DrawShadowedText(draw, Point(layout, 412, 169), WithAlpha(theme.text, layout.alpha),
-			24.0f * layout.scale, title, layout.scale);
-		DrawTextRightAligned(draw, Point(layout, 1216, 176), WithAlpha(theme.muted, layout.alpha),
-			10.0f * layout.scale, "CONTROLLER KEYBOARD");
+			WithAlpha(IM_COL32(0, 2, 9, 255), layout.alpha * s_menu.keyboardVisibility * 0.68f));
+		const ImVec2 panelMin = Point(keyboardLayout, 376, 142);
+		const ImVec2 panelMax = Point(keyboardLayout, 1248, 620);
+		DrawGlassPanel(draw, keyboardLayout, panelMin, panelMax, 9.0f, true);
+		const auto* detailDefinition = s_menu.catalog.Find(s_menu.details.id, s_menu.details.variant);
+		const bool trapLabel = s_menu.searchTarget == SearchTarget::Label && detailDefinition &&
+			detailDefinition->type == skylander_ui::FigureType::Trap;
+		const std::string_view title = s_menu.searchTarget == SearchTarget::Create ? "SEARCH FIGURES" :
+			(s_menu.searchTarget == SearchTarget::Label ?
+				(trapLabel ? "LABEL THIS TRAP" : "LABEL THIS FIGURE") : "SEARCH COLLECTION");
+		DrawTitleText(draw, keyboardLayout, Point(keyboardLayout, 412, 169),
+			24.0f * keyboardLayout.scale, title);
+		DrawTextRightAligned(draw, Point(keyboardLayout, 1216, 176), WithAlpha(theme.muted, keyboardLayout.alpha),
+			10.0f * keyboardLayout.scale, "CONTROLLER + PC KEYBOARD");
 
-		const ImVec2 fieldMin = Point(layout, 412, 210);
-		const ImVec2 fieldMax = Point(layout, 1216, 258);
-		DrawElevatedSurface(draw, layout, fieldMin, fieldMax, true);
+		const ImVec2 fieldMin = Point(keyboardLayout, 412, 210);
+		const ImVec2 fieldMax = Point(keyboardLayout, 1216, 258);
+		DrawAnimatedControlSurface(draw, keyboardLayout, fieldMin, fieldMax, 0.72f, true, theme.accent);
 		const auto& searchText = ActiveSearchText();
-		const std::string_view value = searchText[0] ? std::string_view(searchText.data()) : std::string_view("Search is empty");
-		DrawTextFit(draw, Point(layout, 433, 224),
-			WithAlpha(searchText[0] ? theme.text : theme.muted, layout.alpha),
-			15.0f * layout.scale, DrawerWidth(layout, 760.0f), value);
+		const std::string_view value = searchText[0] ? std::string_view(searchText.data()) :
+			(s_menu.searchTarget == SearchTarget::Label ? std::string_view("No label yet") :
+				std::string_view("Search is empty"));
+		DrawTextFit(draw, Point(keyboardLayout, 433, 224),
+			WithAlpha(searchText[0] ? theme.text : theme.muted, keyboardLayout.alpha),
+			15.0f * keyboardLayout.scale, DrawerWidth(keyboardLayout, 760.0f), value);
 
 		for (int row = 0; row < 5; ++row)
 		{
@@ -3582,10 +5052,20 @@ namespace
 			const float y = 282.0f + row * 56.0f;
 			for (int column = 0; column < count; ++column)
 			{
-				const ImVec2 minimum = Point(layout, startX + column * (keyWidth + gap), y);
-				const ImVec2 maximum = Point(layout, startX + column * (keyWidth + gap) + keyWidth, y + 42.0f);
+				const ImVec2 minimum = Point(keyboardLayout, startX + column * (keyWidth + gap), y);
+				const ImVec2 maximum = Point(keyboardLayout, startX + column * (keyWidth + gap) + keyWidth, y + 42.0f);
 				const bool selected = row == s_menu.keyboardRow && column == s_menu.keyboardColumn;
-				DrawElevatedSurface(draw, layout, minimum, maximum, selected);
+				float& focus = s_menu.keyboardFocusAnimations[row][column];
+				focus = AnimateFocus(focus, selected ? 1.0f : 0.0f);
+				ImU32 accent = theme.accent;
+				if (row == 4)
+				{
+					static constexpr std::array<ImU32, 4> actionColors{
+						IM_COL32(91, 216, 255, 255), IM_COL32(255, 190, 74, 255),
+						IM_COL32(255, 102, 91, 255), IM_COL32(91, 231, 151, 255)};
+					accent = BlendColor(actionColors[column], theme.accent, 0.16f);
+				}
+				DrawAnimatedControlSurface(draw, keyboardLayout, minimum, maximum, focus, false, accent);
 				std::string label;
 				if (row < 4)
 					label.assign(1, KeyboardCharacterRows()[row][column]);
@@ -3596,9 +5076,9 @@ namespace
 					label = actions[column];
 				}
 				DrawTextCentered(draw, {(minimum.x + maximum.x) * 0.5f, (minimum.y + maximum.y) * 0.5f},
-					WithAlpha(selected ? theme.accent : theme.text, layout.alpha),
-					(row == 4 ? 11.0f : 14.0f) * layout.scale, label);
-				if (ClickedRect(layout, minimum, maximum))
+					WithAlpha(selected ? accent : theme.text, keyboardLayout.alpha),
+					(row == 4 ? 11.0f : 14.0f) * keyboardLayout.scale, label);
+				if (ClickedRect(keyboardLayout, minimum, maximum))
 				{
 					s_menu.keyboardRow = row;
 					s_menu.keyboardColumn = column;
@@ -3606,8 +5086,10 @@ namespace
 				}
 			}
 		}
-		DrawTextCentered(draw, Point(layout, 814, 589), WithAlpha(theme.muted, layout.alpha),
-			10.5f * layout.scale, "A  SELECT    X  BACKSPACE    Y  SPACE    B  CLOSE");
+		DrawTextCentered(draw, Point(keyboardLayout, 814, 589), WithAlpha(theme.muted, keyboardLayout.alpha),
+			10.5f * keyboardLayout.scale, s_menu.searchTarget == SearchTarget::Label ?
+				"A  SELECT    X  BACKSPACE    Y  SPACE    START  SAVE    B  CANCEL" :
+				"A  SELECT    X  BACKSPACE    Y  SPACE    START  DONE    B  CLOSE");
 	}
 
 	void MoveLibrarySelection(int delta)
@@ -3615,6 +5097,24 @@ namespace
 		if (s_menu.library.empty())
 			return;
 		const int old = s_menu.selectedLibrary;
+		const auto& rows = BuildCascadeRows();
+		if (rows.size() > 1)
+		{
+			s_menu.selectedCascadeRow = std::clamp(s_menu.selectedCascadeRow, 0,
+				static_cast<int>(rows.size()) - 1);
+			const auto& indices = rows[s_menu.selectedCascadeRow].indices;
+			if (indices.empty())
+				return;
+			int& position = s_menu.cascadeRowPositions[s_menu.selectedCascadeRow];
+			position = (position + delta) % static_cast<int>(indices.size());
+			if (position < 0)
+				position += static_cast<int>(indices.size());
+			s_menu.selectedLibrary = indices[position];
+			UpdateSelectedAnimation(old);
+			if (old != s_menu.selectedLibrary)
+				PulseHaptics();
+			return;
+		}
 		const int count = static_cast<int>(s_menu.library.size());
 		s_menu.selectedLibrary = (s_menu.selectedLibrary + delta) % count;
 		if (s_menu.selectedLibrary < 0)
@@ -3630,12 +5130,12 @@ namespace
 		{
 			if (previous)
 			{
-				s_menu.headerSelection = (s_menu.headerSelection + 3) % 4;
+				s_menu.headerSelection = (s_menu.headerSelection + HeaderItemCount() - 1) % HeaderItemCount();
 				PulseHaptics();
 			}
 			if (next)
 			{
-				s_menu.headerSelection = (s_menu.headerSelection + 1) % 4;
+				s_menu.headerSelection = (s_menu.headerSelection + 1) % HeaderItemCount();
 				PulseHaptics();
 			}
 			if (down)
@@ -3663,7 +5163,7 @@ namespace
 			if (up)
 			{
 				s_menu.focus = FocusArea::Header;
-				s_menu.headerSelection = GetConfig().emulated_usb_devices.emulate_skylander_portal ? 0 : 1;
+				s_menu.headerSelection = PortalMode();
 				PulseHaptics();
 			}
 			if (down)
@@ -3710,11 +5210,29 @@ namespace
 			return;
 		}
 
-		if (up)
+		const auto& cascadeRows = BuildCascadeRows();
+		if (up && cascadeRows.size() > 1 && s_menu.selectedCascadeRow > 0)
+		{
+			const int old = s_menu.selectedLibrary;
+			--s_menu.selectedCascadeRow;
+			SelectCascadeRowCard(cascadeRows, s_menu.selectedCascadeRow);
+			UpdateSelectedAnimation(old);
+			PulseHaptics();
+		}
+		else if (up)
 		{
 			s_menu.focus = FocusArea::ElementFilter;
 			s_menu.selectedElementFilter = std::clamp<sint32>(
 				GetConfig().emulated_usb_devices.skylander_element_filter.GetValue(), 0, 11);
+			PulseHaptics();
+		}
+		if (down && cascadeRows.size() > 1 &&
+			s_menu.selectedCascadeRow + 1 < static_cast<int>(cascadeRows.size()))
+		{
+			const int old = s_menu.selectedLibrary;
+			++s_menu.selectedCascadeRow;
+			SelectCascadeRowCard(cascadeRows, s_menu.selectedCascadeRow);
+			UpdateSelectedAnimation(old);
 			PulseHaptics();
 		}
 		if (previous)
@@ -3758,11 +5276,17 @@ namespace
 			bool details{};
 			bool sort{};
 			bool favorite{};
+			bool start{};
+			bool dpadUp{};
+			bool dpadDown{};
+			bool dpadLeft{};
+			bool dpadRight{};
+			glm::vec2 axis{};
 
 			bool AnyControlDown() const
 			{
 				return open || back || up || down || left || right || accept || remove || details || sort ||
-					favorite;
+					favorite || start;
 			}
 		};
 		std::array<ControllerSnapshot, InputManager::kMaxController> snapshots{};
@@ -3776,20 +5300,25 @@ namespace
 			snapshot.connected = true;
 			snapshot.open = controller->is_quick_menu_down();
 			snapshot.back = controller->is_b_down();
-			snapshot.up = controller->is_up_down();
-			snapshot.down = controller->is_down_down();
-			snapshot.left = controller->is_left_down();
-			snapshot.right = controller->is_right_down();
+			snapshot.dpadUp = controller->is_up_down();
+			snapshot.dpadDown = controller->is_down_down();
+			snapshot.dpadLeft = controller->is_left_down();
+			snapshot.dpadRight = controller->is_right_down();
+			snapshot.up = snapshot.dpadUp;
+			snapshot.down = snapshot.dpadDown;
+			snapshot.left = snapshot.dpadLeft;
+			snapshot.right = snapshot.dpadRight;
 			snapshot.accept = controller->is_a_down();
 			snapshot.remove = controller->is_x_down();
 			snapshot.details = controller->is_y_down();
 			snapshot.sort = controller->is_l_down();
 			snapshot.favorite = controller->is_r_down();
-			const glm::vec2 axis = controller->get_axis();
-			snapshot.left |= axis.x < -0.55f;
-			snapshot.right |= axis.x > 0.55f;
-			snapshot.up |= axis.y > 0.55f;
-			snapshot.down |= axis.y < -0.55f;
+			snapshot.start = controller->is_start_down();
+			snapshot.axis = controller->get_axis();
+			snapshot.left |= snapshot.axis.x < -0.55f;
+			snapshot.right |= snapshot.axis.x > 0.55f;
+			snapshot.up |= snapshot.axis.y > 0.55f;
+			snapshot.down |= snapshot.axis.y < -0.55f;
 			anyControlDown |= snapshot.AnyControlDown();
 		}
 
@@ -3820,6 +5349,8 @@ namespace
 		bool detailsDown = false;
 		bool sortDown = false;
 		bool favoriteDown = false;
+		bool startDown = false;
+		glm::vec2 colorEditorAxis{};
 		if (s_menu.ownerController >= 0)
 		{
 			const auto& snapshot = snapshots[s_menu.ownerController];
@@ -3833,6 +5364,22 @@ namespace
 			detailsDown = snapshot.details;
 			sortDown = snapshot.sort;
 			favoriteDown = snapshot.favorite;
+			startDown = snapshot.start;
+			colorEditorAxis = snapshot.axis;
+			if (s_menu.page == RiftPage::ColorEditor)
+			{
+				upDown = snapshot.dpadUp;
+				downDown = snapshot.dpadDown;
+				leftDown = snapshot.dpadLeft;
+				rightDown = snapshot.dpadRight;
+			}
+		}
+		if (s_menu.requestedOpen && s_menu.ownerController >= 0 &&
+			snapshots[s_menu.ownerController].AnyControlDown())
+		{
+			s_menu.mouseNavigationActive = false;
+			if (s_menu.searchTarget == SearchTarget::None)
+				s_textInputTarget.store(0, std::memory_order_release);
 		}
 		s_menu.controlsNeutral = s_menu.ownerController >= 0 ?
 			!snapshots[s_menu.ownerController].AnyControlDown() : !anyControlDown;
@@ -3850,6 +5397,8 @@ namespace
 			{
 				if (backDown && !s_menu.backWasDown)
 					CloseSearchKeyboard();
+				else if (startDown && !s_menu.startWasDown)
+					CommitSearchKeyboard();
 				else
 				{
 					if (previous) MoveKeyboardHorizontal(-1);
@@ -3867,6 +5416,8 @@ namespace
 					SetMenuOpen(false, false);
 				else if (s_menu.page == RiftPage::DeleteConfirm)
 					s_menu.page = RiftPage::Details;
+				else if (s_menu.page == RiftPage::ColorEditor)
+					FinishColorEditor();
 				else
 				{
 					s_menu.page = RiftPage::Dashboard;
@@ -3934,6 +5485,8 @@ namespace
 				}
 				if (favoriteDown && !s_menu.favoriteWasDown && s_menu.details.fromLibrary)
 					ToggleFavoritePath(s_menu.details.filePath, s_menu.details.name);
+				if (detailsDown && !s_menu.detailsWasDown && s_menu.details.fromLibrary)
+					OpenLabelKeyboard();
 			}
 			else if (s_menu.page == RiftPage::DeleteConfirm)
 			{
@@ -3948,7 +5501,7 @@ namespace
 					if (previous || next)
 					{
 						s_menu.forgeToolbarSelection = WrapChoice(
-							s_menu.forgeToolbarSelection + (next ? 1 : -1), 4);
+							s_menu.forgeToolbarSelection + (next ? 1 : -1), 5);
 						PulseHaptics();
 					}
 					if (down)
@@ -3963,16 +5516,21 @@ namespace
 						case 0: OpenSearchKeyboard(SearchTarget::Create); break;
 						case 1: CycleForgeSort(); break;
 						case 2: CycleForgeTypeFilter(); break;
-						default: CycleForgeElementFilter(); break;
+						case 3: CycleForgeElementFilter(); break;
+						default: CycleForgeGameFilter(); break;
 						}
 					}
 				}
 				else
 				{
-					if (up && (definitions.empty() ||
-						(s_menu.selectedDefinition % kLibraryPageSize) < kLibraryColumns))
+					if (up && (definitions.empty() || s_menu.selectedDefinition < kLibraryColumns))
 					{
 						s_menu.forgeToolbarFocused = true;
+						if (!definitions.empty())
+						{
+							static constexpr std::array<int, kLibraryColumns> nearestTool{0, 1, 2, 4};
+							s_menu.forgeToolbarSelection = nearestTool[s_menu.selectedDefinition % kLibraryColumns];
+						}
 						PulseHaptics();
 					}
 					else if (!definitions.empty() && (previous || next || up || down))
@@ -3995,22 +5553,63 @@ namespace
 				if (detailsDown && !s_menu.detailsWasDown)
 					CycleForgeElementFilter();
 			}
+			else if (s_menu.page == RiftPage::ColorEditor)
+			{
+				auto shapeAxis = [](float value) {
+					const float magnitude = std::abs(value);
+					if (magnitude <= 0.28f)
+						return 0.0f;
+					return std::copysign(std::pow((magnitude - 0.28f) / 0.72f, 1.35f), value);
+				};
+				const float delta = std::clamp(ImGui::GetIO().DeltaTime, 0.0f, 0.05f);
+				const float cursorX = shapeAxis(colorEditorAxis.x) * 0.72f * delta;
+				const float cursorY = -shapeAxis(colorEditorAxis.y) * 0.72f * delta;
+				if (cursorX != 0.0f || cursorY != 0.0f)
+					MoveColorEditorCursor(cursorX, cursorY, false);
+				if (previous)
+					MoveColorEditorCursor(-0.055f, 0.0f);
+				if (next)
+					MoveColorEditorCursor(0.055f, 0.0f);
+				if (up)
+					MoveColorEditorCursor(0.0f, -0.055f);
+				if (down)
+					MoveColorEditorCursor(0.0f, 0.055f);
+				if (removeDown && !s_menu.removeWasDown)
+					AdjustColorEditorBrightness(-0.035f);
+				if (detailsDown && !s_menu.detailsWasDown)
+					AdjustColorEditorBrightness(0.035f);
+				if (sortDown && !s_menu.sortWasDown)
+				{
+					s_menu.colorEditorTarget = 0;
+					PulseHaptics();
+				}
+				if (favoriteDown && !s_menu.favoriteWasDown)
+				{
+					s_menu.colorEditorTarget = 1;
+					PulseHaptics();
+				}
+				if (acceptDown && !s_menu.acceptWasDown)
+				{
+					FinishColorEditor();
+					PulseHaptics(UiSound::Confirm);
+				}
+			}
 			else if (s_menu.page == RiftPage::Options)
 			{
 				if (up || down)
 				{
-					const int column = s_menu.selectedOption / 8;
-					const int count = column == 0 ? 8 : kOptionCount - 8;
-					const int row = WrapChoice(s_menu.selectedOption % 8 + (down ? 1 : -1), count);
-					s_menu.selectedOption = column * 8 + row;
+					const int column = s_menu.selectedOption / 9;
+					const int count = column == 0 ? 9 : kOptionCount - 9;
+					const int row = WrapChoice(s_menu.selectedOption % 9 + (down ? 1 : -1), count);
+					s_menu.selectedOption = column * 9 + row;
 					PulseHaptics();
 				}
 				if (previous || next)
 				{
 					const int old = s_menu.selectedOption;
-					const int row = s_menu.selectedOption % 8;
+					const int row = s_menu.selectedOption % 9;
 					const int column = next ? 1 : 0;
-					s_menu.selectedOption = column * 8 + std::min(row, column == 0 ? 7 : kOptionCount - 9);
+					s_menu.selectedOption = column * 9 + std::min(row, column == 0 ? 8 : kOptionCount - 10);
 					if (old != s_menu.selectedOption) PulseHaptics();
 				}
 				if (acceptDown && !s_menu.acceptWasDown)
@@ -4020,8 +5619,20 @@ namespace
 			{
 				if (up || down)
 				{
-					s_menu.selectedLibraryOption = (s_menu.selectedLibraryOption + (down ? 1 : 4)) % 5;
+					const int column = s_menu.selectedLibraryOption / 6;
+					const int count = column == 0 ? 6 : kLibraryOptionCount - 6;
+					const int row = WrapChoice(s_menu.selectedLibraryOption % 6 + (down ? 1 : -1), count);
+					s_menu.selectedLibraryOption = column * 6 + row;
 					PulseHaptics();
+				}
+				if (previous || next)
+				{
+					const int old = s_menu.selectedLibraryOption;
+					const int row = s_menu.selectedLibraryOption % 6;
+					const int column = next ? 1 : 0;
+					s_menu.selectedLibraryOption = column * 6 +
+						std::min(row, column == 0 ? 5 : kLibraryOptionCount - 7);
+					if (old != s_menu.selectedLibraryOption) PulseHaptics();
 				}
 				if (acceptDown && !s_menu.acceptWasDown)
 					AdjustLibraryOption(s_menu.selectedLibraryOption, 1);
@@ -4038,6 +5649,7 @@ namespace
 		s_menu.detailsWasDown = detailsDown;
 		s_menu.sortWasDown = sortDown;
 		s_menu.favoriteWasDown = favoriteDown;
+		s_menu.startWasDown = startDown;
 	}
 
 	void RenderQuickMenu(bool padView)
@@ -4058,9 +5670,12 @@ namespace
 		if (padView)
 			return;
 		ReloadCatalogIfNeeded();
-		if (!s_menu.requestedOpen && s_menu.visibility < 0.01f)
-			PumpArtworkTextureUploads();
+		PumpArtworkTextureUploads();
+		UpdateMouseNavigationMode();
 		HandleControllerInput();
+		ProcessTextInputQueue();
+		if (s_menu.searchTarget == SearchTarget::None && ImGui::IsMouseClicked(0))
+			s_textInputTarget.store(0, std::memory_order_release);
 		UpdateHaptics();
 		ImGui_SetGamepadNavigationEnabled(!s_menu.requestedOpen);
 
@@ -4070,8 +5685,9 @@ namespace
 			s_menu.visibility = targetVisibility;
 		else
 		{
-			const float speed = motion == 1 ? (s_menu.requestedOpen ? 18.0f : 24.0f) :
-				(s_menu.requestedOpen ? 6.4f : 10.5f);
+			const float speed = s_menu.requestedOpen ?
+				MotionValue(18.0f, 6.0f, 4.6f, 3.7f) :
+				MotionValue(24.0f, 9.0f, 7.0f, 5.6f);
 			s_menu.visibility = SmoothTowards(s_menu.visibility, targetVisibility, speed);
 		}
 		if (s_menu.inputCaptureLatched)
@@ -4090,8 +5706,10 @@ namespace
 			else
 				s_menu.neutralInputFrames = 0;
 		}
-		s_menu.selectionFlash = motion == 0 ? 0.0f : SmoothTowards(s_menu.selectionFlash, 0.0f, motion == 1 ? 15.0f : 8.5f);
-		s_menu.portalModeFlash = motion == 0 ? 0.0f : SmoothTowards(s_menu.portalModeFlash, 0.0f, motion == 1 ? 10.0f : 6.0f);
+		s_menu.selectionFlash = motion == 0 ? 0.0f : SmoothTowards(s_menu.selectionFlash, 0.0f,
+			MotionValue(15.0f, 7.5f, 5.8f, 4.6f));
+		s_menu.portalModeFlash = motion == 0 ? 0.0f : SmoothTowards(s_menu.portalModeFlash, 0.0f,
+			MotionValue(10.0f, 5.5f, 4.2f, 3.4f));
 		if (motion == 0)
 		{
 			s_menu.placementAnimation = 1.0f;
@@ -4115,20 +5733,20 @@ namespace
 			s_menu.pageVisibility = MotionEnabled() ? 0.0f : 1.0f;
 		}
 		s_menu.pageVisibility = MotionEnabled() ? SmoothTowards(s_menu.pageVisibility, 1.0f,
-			MotionLevel() == 2 ? 8.0f : 15.0f) : 1.0f;
+			MotionValue(15.0f, 7.0f, 5.4f, 4.3f)) : 1.0f;
 		if (s_menu.visibility < 0.01f && !s_menu.requestedOpen)
 			return;
 
 		const ImVec2 display = ImGui::GetIO().DisplaySize;
 		const float baseScale = std::max(0.55f, std::min(display.x / 1280.0f, display.y / 720.0f));
 		const float easedVisibility = EaseOutCubic(s_menu.visibility);
-		const float zoom = motion == 2 ? 0.975f + easedVisibility * 0.025f :
+		const float zoom = motion >= 2 ? 0.975f + easedVisibility * 0.025f :
 			(motion == 1 ? 0.995f + easedVisibility * 0.005f : 1.0f);
 		RiftLayout layout;
 		layout.scale = baseScale * zoom;
 		layout.origin = {display.x - 1280.0f * layout.scale, (display.y - 720.0f * layout.scale) * 0.5f};
 		layout.alpha = easedVisibility;
-		layout.slideX = (1.0f - layout.alpha) * (motion == 2 ? 82.0f : motion == 1 ? 12.0f : 0.0f);
+		layout.slideX = (1.0f - layout.alpha) * (motion >= 2 ? 82.0f : motion == 1 ? 12.0f : 0.0f);
 
 		ImGui::SetNextWindowPos({0, 0}, ImGuiCond_Always);
 		ImGui::SetNextWindowSize(display, ImGuiCond_Always);
@@ -4143,13 +5761,14 @@ namespace
 			DrawBackdrop(draw, layout, display);
 			RiftLayout pageLayout = layout;
 			const float pageEase = SmoothStep(s_menu.pageVisibility);
-			pageLayout.slideX += (1.0f - pageEase) * (MotionLevel() == 2 ? 22.0f : 8.0f);
+			pageLayout.slideX += (1.0f - pageEase) * (MotionLevel() >= 2 ? 22.0f : 8.0f);
 			switch (s_menu.page)
 			{
 			case RiftPage::Dashboard: DrawDashboard(draw, pageLayout); break;
 			case RiftPage::Details: DrawDetailsPage(draw, pageLayout); break;
 			case RiftPage::Forge: DrawForgePage(draw, pageLayout); break;
 			case RiftPage::Options: DrawOptionsPage(draw, pageLayout); break;
+			case RiftPage::ColorEditor: DrawColorEditorPage(draw, pageLayout); break;
 			case RiftPage::LibraryOrder: DrawLibraryOrderPage(draw, pageLayout); break;
 			case RiftPage::DeleteConfirm: DrawDeleteConfirmPage(draw, pageLayout); break;
 			}
@@ -4180,6 +5799,24 @@ void SkylanderQuickMenu_Reset()
 {
 	s_resetRequested.store(true, std::memory_order_release);
 	EmulatedController::SetRiftInputCaptured(false);
+}
+
+bool SkylanderQuickMenu_HandleCharacter(unsigned int codepoint)
+{
+	const int target = s_textInputTarget.load(std::memory_order_acquire);
+	if (target < static_cast<int>(SearchTarget::Collection) ||
+		target > static_cast<int>(SearchTarget::Label))
+		return false;
+	const bool text = codepoint >= 32 && codepoint <= 0x10FFFF;
+	const bool command = codepoint == 8 || codepoint == 10 || codepoint == 13 ||
+		codepoint == 27 || codepoint == 127;
+	if (!text && !command)
+		return false;
+	{
+		const std::lock_guard lock(s_textInputMutex);
+		s_textInputQueue.emplace_back(target, codepoint);
+	}
+	return true;
 }
 
 bool SkylanderQuickMenu_ConsumeUpdateCheckRequest()

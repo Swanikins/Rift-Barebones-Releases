@@ -39,7 +39,7 @@ void CemuConfig::Load(XMLConfigParser& parser)
 	use_discord_presence = parser.get("use_discord_presence", true);
 	fullscreen_menubar = parser.get("fullscreen_menubar", false);
 	feral_gamemode = parser.get("feral_gamemode", false);
-	check_update = parser.get("check_update", check_update);
+	check_update = parser.get("rift_auto_check_update", true);
 	receive_untested_updates = parser.get("receive_untested_updates", receive_untested_updates);
 	save_screenshot = parser.get("save_screenshot", save_screenshot);
 	did_show_vulkan_warning = parser.get("vk_warning", did_show_vulkan_warning);
@@ -348,26 +348,26 @@ void CemuConfig::Load(XMLConfigParser& parser)
 	// emulatedusbdevices
 	auto usbdevices = parser.get("EmulatedUsbDevices");
 	emulated_usb_devices.emulate_skylander_portal = usbdevices.get("EmulateSkylanderPortal", emulated_usb_devices.emulate_skylander_portal);
-	emulated_usb_devices.skylander_hybrid_mode_enabled = usbdevices.get("SkylanderHybridModeEnabled", emulated_usb_devices.skylander_hybrid_mode_enabled);
+	emulated_usb_devices.skylander_hybrid_mode_enabled = true;
 	emulated_usb_devices.skylander_portal_mode = std::clamp(usbdevices.get<sint32>("SkylanderPortalMode",
 		emulated_usb_devices.emulate_skylander_portal.GetValue() ? 0 : 1), 0, 2);
-	if (emulated_usb_devices.skylander_portal_mode.GetValue() == 2 && !emulated_usb_devices.skylander_hybrid_mode_enabled.GetValue())
-		emulated_usb_devices.skylander_portal_mode = 0;
 	emulated_usb_devices.emulate_skylander_portal = emulated_usb_devices.skylander_portal_mode.GetValue() != 1;
 	emulated_usb_devices.skylander_collection_path = usbdevices.get("SkylanderCollectionPath", emulated_usb_devices.skylander_collection_path);
 	emulated_usb_devices.skylander_sort_mode = usbdevices.get("SkylanderSortMode", emulated_usb_devices.skylander_sort_mode);
 	emulated_usb_devices.skylander_favorites = usbdevices.get("SkylanderFavorites", emulated_usb_devices.skylander_favorites);
-	emulated_usb_devices.skylander_motion_level = std::clamp(usbdevices.get<sint32>("SkylanderMotionLevel", emulated_usb_devices.skylander_motion_level), 0, 2);
+	emulated_usb_devices.skylander_motion_level = std::clamp(usbdevices.get<sint32>("SkylanderMotionLevel", emulated_usb_devices.skylander_motion_level), 0, 4);
 	emulated_usb_devices.skylander_bloom_level = std::clamp(usbdevices.get<sint32>("SkylanderBloomLevel", emulated_usb_devices.skylander_bloom_level), 0, 2);
 	emulated_usb_devices.skylander_ui_sound = usbdevices.get("SkylanderUiSound", emulated_usb_devices.skylander_ui_sound);
 	emulated_usb_devices.skylander_ui_haptics = usbdevices.get("SkylanderUiHaptics", emulated_usb_devices.skylander_ui_haptics);
 	emulated_usb_devices.skylander_ui_preset = std::clamp(usbdevices.get<sint32>("SkylanderUiPreset", emulated_usb_devices.skylander_ui_preset), 0, 4);
 	emulated_usb_devices.skylander_sound_profile = std::clamp(usbdevices.get<sint32>("SkylanderSoundProfile", emulated_usb_devices.skylander_sound_profile), 0, 4);
 	emulated_usb_devices.skylander_haptic_strength = std::clamp(usbdevices.get<sint32>("SkylanderHapticStrength", emulated_usb_devices.skylander_haptic_strength), 0, 3);
-	emulated_usb_devices.skylander_theme = std::clamp(usbdevices.get<sint32>("SkylanderTheme", emulated_usb_devices.skylander_theme), 0, 4);
-	emulated_usb_devices.skylander_accent = std::clamp(usbdevices.get<sint32>("SkylanderAccent", emulated_usb_devices.skylander_accent), 0, 5);
+	emulated_usb_devices.skylander_theme = std::clamp(usbdevices.get<sint32>("SkylanderTheme", emulated_usb_devices.skylander_theme), 0, 5);
+	emulated_usb_devices.skylander_accent = std::clamp(usbdevices.get<sint32>("SkylanderAccent", emulated_usb_devices.skylander_accent), 0, 6);
+	emulated_usb_devices.skylander_custom_theme = usbdevices.get<uint32>("SkylanderCustomTheme", emulated_usb_devices.skylander_custom_theme.GetValue()) & 0xFFFFFF;
+	emulated_usb_devices.skylander_custom_accent = usbdevices.get<uint32>("SkylanderCustomAccent", emulated_usb_devices.skylander_custom_accent.GetValue()) & 0xFFFFFF;
 	emulated_usb_devices.skylander_card_effect = std::clamp(usbdevices.get<sint32>("SkylanderCardEffect", emulated_usb_devices.skylander_card_effect), 0, 3);
-	emulated_usb_devices.skylander_card_border = std::clamp(usbdevices.get<sint32>("SkylanderCardBorder", emulated_usb_devices.skylander_card_border), 0, 3);
+	emulated_usb_devices.skylander_card_border = std::clamp(usbdevices.get<sint32>("SkylanderCardBorder", emulated_usb_devices.skylander_card_border), 0, 1);
 	emulated_usb_devices.skylander_card_texture = std::clamp(usbdevices.get<sint32>("SkylanderCardTexture", emulated_usb_devices.skylander_card_texture), 0, 3);
 	emulated_usb_devices.skylander_hub_palette = usbdevices.get<std::string>("SkylanderHubPalette", "");
 	emulated_usb_devices.skylander_hub_spacing = std::clamp(usbdevices.get<sint32>("SkylanderHubSpacing", 100), 75, 125);
@@ -378,7 +378,9 @@ void CemuConfig::Load(XMLConfigParser& parser)
 	emulated_usb_devices.skylander_particle_level = std::clamp(usbdevices.get<sint32>("SkylanderParticleLevel", emulated_usb_devices.skylander_particle_level), 0, 3);
 	emulated_usb_devices.skylander_corner_style = std::clamp(usbdevices.get<sint32>("SkylanderCornerStyle", emulated_usb_devices.skylander_corner_style), 0, 2);
 	emulated_usb_devices.skylander_drawer_opacity = std::clamp(usbdevices.get<sint32>("SkylanderDrawerOpacity", emulated_usb_devices.skylander_drawer_opacity), 0, 100);
-	emulated_usb_devices.skylander_card_density = std::clamp(usbdevices.get<sint32>("SkylanderCardDensity", emulated_usb_devices.skylander_card_density), 5, 11);
+	emulated_usb_devices.skylander_card_density = std::clamp(usbdevices.get<sint32>("SkylanderCardDensity", emulated_usb_devices.skylander_card_density), 5, 15);
+	emulated_usb_devices.skylander_cascade_rows_layout = std::clamp(usbdevices.get<sint32>("SkylanderCascadeRowsLayout", emulated_usb_devices.skylander_cascade_rows_layout), 0, 3);
+	emulated_usb_devices.skylander_cascade_rows = usbdevices.get("SkylanderCascadeRows", emulated_usb_devices.skylander_cascade_rows);
 	emulated_usb_devices.skylander_priority_mode = std::clamp(usbdevices.get<sint32>("SkylanderPriorityMode", emulated_usb_devices.skylander_priority_mode), 0, 4);
 	emulated_usb_devices.skylander_filter_mode = std::clamp(usbdevices.get<sint32>("SkylanderFilterMode", emulated_usb_devices.skylander_filter_mode), 0, 5);
 	emulated_usb_devices.skylander_element_priority = std::clamp(usbdevices.get<sint32>("SkylanderElementPriority", emulated_usb_devices.skylander_element_priority), 0, 11);
@@ -400,6 +402,7 @@ void CemuConfig::Save(XMLConfigParser& parser)
 	config.set<bool>("fullscreen_menubar", fullscreen_menubar);
     	config.set<bool>("feral_gamemode", feral_gamemode);
 	config.set<bool>("check_update", check_update);
+	config.set<bool>("rift_auto_check_update", check_update);
 	config.set<bool>("receive_untested_updates", receive_untested_updates);
 	config.set<bool>("save_screenshot", save_screenshot);
 	config.set<bool>("vk_warning", did_show_vulkan_warning);
@@ -598,6 +601,8 @@ void CemuConfig::Save(XMLConfigParser& parser)
 	usbdevices.set("SkylanderHapticStrength", emulated_usb_devices.skylander_haptic_strength.GetValue());
 	usbdevices.set("SkylanderTheme", emulated_usb_devices.skylander_theme.GetValue());
 	usbdevices.set("SkylanderAccent", emulated_usb_devices.skylander_accent.GetValue());
+	usbdevices.set("SkylanderCustomTheme", emulated_usb_devices.skylander_custom_theme.GetValue());
+	usbdevices.set("SkylanderCustomAccent", emulated_usb_devices.skylander_custom_accent.GetValue());
 	usbdevices.set("SkylanderCardEffect", emulated_usb_devices.skylander_card_effect.GetValue());
 	usbdevices.set("SkylanderCardBorder", emulated_usb_devices.skylander_card_border.GetValue());
 	usbdevices.set("SkylanderCardTexture", emulated_usb_devices.skylander_card_texture.GetValue());
@@ -611,6 +616,8 @@ void CemuConfig::Save(XMLConfigParser& parser)
 	usbdevices.set("SkylanderCornerStyle", emulated_usb_devices.skylander_corner_style.GetValue());
 	usbdevices.set("SkylanderDrawerOpacity", emulated_usb_devices.skylander_drawer_opacity.GetValue());
 	usbdevices.set("SkylanderCardDensity", emulated_usb_devices.skylander_card_density.GetValue());
+	usbdevices.set("SkylanderCascadeRowsLayout", emulated_usb_devices.skylander_cascade_rows_layout.GetValue());
+	usbdevices.set("SkylanderCascadeRows", emulated_usb_devices.skylander_cascade_rows.GetValue());
 	usbdevices.set("SkylanderPriorityMode", emulated_usb_devices.skylander_priority_mode.GetValue());
 	usbdevices.set("SkylanderFilterMode", emulated_usb_devices.skylander_filter_mode.GetValue());
 	usbdevices.set("SkylanderElementPriority", emulated_usb_devices.skylander_element_priority.GetValue());
