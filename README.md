@@ -6,9 +6,11 @@ This started as a personal project, and it is also my first public project, so p
 
 The **Rift of Power** puts your collection, figure creation, portal controls, and Rift settings into one in-game menu. It is designed mainly for controllers, while mouse and keyboard remain (kinda) available. I tried my best to make the UI/UX be as intuitive as possible, borrowing many elements from the Steam OS big screen menu that I just LOVE
 
-Iteration 006.4 supports Virtual, Physical, and Hybrid Portal modes, meaning we can use real and virtual figures together.
+Iteration 006.5 supports Virtual, Physical, and Hybrid Portal modes, meaning we can use real and virtual figures together.
 
-## What's new in Iteration 006.4?
+## What's new in Iteration 006.5?
+
+Iteration 006.5 keeps everything added in 006.4 and fixes the built-in updater for people moving from 006.3 or the first 006.4 build.
 
 Physical and Hybrid Portal modes can now send game audio through a real Portal of Power again. Swapper halves also stay together in the Current Portal so they are easier to keep track of.
 
