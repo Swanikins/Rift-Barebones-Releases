@@ -541,8 +541,9 @@ void CemuUpdateWindow::WorkerThread()
 			else if (m_order == WorkerOrder::UpdateVersion)
 			{
 				const std::string url = m_downloadUrl;
-				if (!exists(tmppath))
-					create_directory(tmppath);
+				if (exists(tmppath))
+					remove_all(tmppath);
+				create_directory(tmppath);
 
 #if BOOST_OS_WINDOWS
 				const auto update_file = tmppath / L"update.zip";
@@ -572,10 +573,13 @@ void CemuUpdateWindow::WorkerThread()
 #if BOOST_OS_WINDOWS
 				if (!ExtractUpdate(update_file, tmppath, cemuFolderName))
 				{
+					if (m_order == WorkerOrder::Exit)
+						break;
 					cemuLog_log(LogType::Force, "Extracting the Rift update failed");
 					auto* event = new wxCommandEvent(wxEVT_RESULT);
 					event->SetInt((int)Result::ExtractError);
 					wxQueueEvent(this, event);
+					m_order = WorkerOrder::Idle;
 					continue;
 				}
 				if (cemuFolderName.empty())
@@ -584,6 +588,7 @@ void CemuUpdateWindow::WorkerThread()
 					auto* event = new wxCommandEvent(wxEVT_RESULT);
 					event->SetInt((int)Result::ExtractError);
 					wxQueueEvent(this, event);
+					m_order = WorkerOrder::Idle;
 					continue;
 				}
 #endif
@@ -613,6 +618,7 @@ void CemuUpdateWindow::WorkerThread()
 						}
 					}
 
+					m_order = WorkerOrder::Idle;
 					continue;
 				}
 
@@ -629,6 +635,7 @@ void CemuUpdateWindow::WorkerThread()
 					auto* resultEvent = new wxCommandEvent(wxEVT_RESULT);
 					resultEvent->SetInt((int)Result::Error);
 					wxQueueEvent(this, resultEvent);
+					m_order = WorkerOrder::Idle;
 					continue;
 				}
 
@@ -692,6 +699,7 @@ void CemuUpdateWindow::WorkerThread()
 					auto* resultEvent = new wxCommandEvent(wxEVT_RESULT);
 					resultEvent->SetInt((int)Result::Error);
 					wxQueueEvent(this, resultEvent);
+					m_order = WorkerOrder::Idle;
 					continue;
 				}
 				m_restartFile = exec;
