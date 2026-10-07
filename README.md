@@ -6,17 +6,13 @@ This started as a personal project, and it is also my first public project, so p
 
 The **Rift of Power** puts your collection, figure creation, portal controls, and Rift settings into one in-game menu. It is designed mainly for controllers, while mouse and keyboard remain (kinda) available. I tried my best to make the UI/UX be as intuitive as possible, borrowing many elements from the Steam OS big screen menu that I just LOVE
 
-Iteration 006.5 supports Virtual, Physical, and Hybrid Portal modes, meaning we can use real and virtual figures together.
+Iteration 006.6 supports Virtual, Physical, and Hybrid Portal modes, meaning we can use real and virtual figures together.
 
-## What's new in Iteration 006.5?
+## What's new in Iteration 006.6?
 
-Iteration 006.5 keeps everything added in 006.4 and fixes the built-in updater for people moving from 006.3 or the first 006.4 build.
+Iteration 006.6 makes older Cemu Skylander collections work properly, including supported files organized into subfolders.
 
-Physical and Hybrid Portal modes can now send game audio through a real Portal of Power again. Swapper halves also stay together in the Current Portal so they are easier to keep track of.
-
-The Rift of Power now has a controller-friendly color editor for choosing exact theme and accent colors while keeping all of the presets. The corner setting also applies to cards, and Flat is now the default cascade shape.
-
-Configurable card rows are smoother, faster, and more consistent across every cascade style. Small categories no longer duplicate or glitch cards when the selected card count is higher than the number of figures in that row.
+Collection messages now explain whether Rift could not find supported files or whether the current search and filters are hiding them. After an automatic update, Rift also shows a short summary of what changed.
 
 ## Why Rift?
 

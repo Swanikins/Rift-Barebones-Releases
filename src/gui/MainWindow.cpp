@@ -1842,8 +1842,27 @@ void MainWindow::OnTimer(wxTimerEvent& event)
 		if (fs::is_regular_file(markerPath, markerError) && !markerError)
 		{
 			fs::remove(markerPath, markerError);
-			wxMessageBox(_("Rift updated successfully."), _("Rift update"),
-				wxOK | wxCENTRE | wxICON_INFORMATION, this);
+			wxString message = _("Rift updated successfully to Iteration ");
+			message += wxHelper::FromUtf8(RiftVersion::Iteration);
+			message += _(".\n\nWhat's new\n\n");
+			message += wxHelper::FromUtf8(RiftVersion::UserChangelog);
+			wxDialog updateDialog(this, wxID_ANY, _("Rift update"), wxDefaultPosition, wxDefaultSize,
+				wxDEFAULT_DIALOG_STYLE);
+			auto* updateSizer = new wxBoxSizer(wxVERTICAL);
+			auto* updateText = new wxStaticText(&updateDialog, wxID_ANY, message);
+			updateText->Wrap(540);
+			updateSizer->Add(updateText, 0, wxALL | wxEXPAND, 18);
+			updateSizer->Add(new wxStaticText(&updateDialog, wxID_ANY,
+				_("More features for Rift coming soon!")), 0, wxLEFT | wxRIGHT | wxBOTTOM, 18);
+			updateSizer->Add(new wxHyperlinkCtrl(&updateDialog, wxID_ANY,
+				_("Support Rift on Ko-fi"), "https://ko-fi.com/swanikin"),
+				0, wxLEFT | wxRIGHT | wxBOTTOM, 18);
+			updateSizer->Add(updateDialog.CreateStdDialogButtonSizer(wxOK),
+				0, wxLEFT | wxRIGHT | wxBOTTOM | wxALIGN_RIGHT, 18);
+			updateDialog.SetSizerAndFit(updateSizer);
+			updateDialog.SetMinSize(wxSize(600, updateDialog.GetSize().GetHeight()));
+			updateDialog.CentreOnParent();
+			updateDialog.ShowModal();
 		}
 	}
 

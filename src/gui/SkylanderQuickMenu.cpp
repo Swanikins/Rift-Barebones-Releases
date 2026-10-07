@@ -3555,9 +3555,10 @@ namespace
 			std::error_code folderError;
 			const bool folderExists = !configuredFolder.empty() &&
 				fs::is_directory(_utf8ToPath(configuredFolder), folderError) && !folderError;
-			const char* heading = CurrentSortMode() == SortMode::FavoritesOnly ?
-				"NO FAVORITES MATCH THIS FILTER" : "NO .SKY FILES MATCH";
-			std::string guidance = "CHANGE THE FILTER OR COLLECTION FOLDER";
+			const char* heading = "NO FIGURES MATCH";
+			std::string guidance = s_menu.searchText[0] != '\0' ?
+				"CLEAR THE SEARCH OR CHANGE YOUR FILTERS" :
+				"SET FIGURE FILTER TO EVERYTHING AND ELEMENT TO ALL";
 			if (!catalogError.empty())
 			{
 				heading = "RIFT ASSET LIBRARY COULD NOT LOAD";
@@ -3572,6 +3573,11 @@ namespace
 			{
 				heading = "COLLECTION FOLDER COULD NOT BE FOUND";
 				guidance = "CHOOSE AN EXISTING FOLDER IN GENERAL SETTINGS";
+			}
+			else if (s_menu.catalog.GetCollection().empty())
+			{
+				heading = "NO SUPPORTED FIGURE FILES FOUND";
+				guidance = "RIFT CHECKED THIS FOLDER AND ITS SUBFOLDERS";
 			}
 			DrawTextCentered(draw, Point(layout, 790, 456),
 				WithAlpha(theme.text, layout.alpha),

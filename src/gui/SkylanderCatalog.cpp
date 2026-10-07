@@ -285,18 +285,17 @@ namespace skylander_ui
 				continue;
 			}
 			if (!it->is_regular_file(ec)) continue;
-			const uintmax_t fileSize = it->file_size(ec);
-			if (ec || fileSize != nsyshid::SKY_FIGURE_SIZE) { ec.clear(); continue; }
 			auto extension = _pathToUtf8(it->path().extension());
 			std::transform(extension.begin(), extension.end(), extension.begin(), [](unsigned char c) { return std::tolower(c); });
 			if (extension != ".sky" && extension != ".bin" && extension != ".dump" && extension != ".dmp") continue;
-			auto data = FileStream::LoadIntoMemory(it->path());
-			if (!data || data->size() != nsyshid::SKY_FIGURE_SIZE) continue;
-			const uint8 bcc = (*data)[0] ^ (*data)[1] ^ (*data)[2] ^ (*data)[3];
-			if ((*data)[4] != bcc || (*data)[5] != 0x81 || (*data)[6] != 0x01 || (*data)[7] != 0x0F)
+			std::unique_ptr<FileStream> file(FileStream::openFile2(it->path()));
+			if (!file)
 				continue;
-			const uint16 id = (*data)[0x10] | (uint16((*data)[0x11]) << 8);
-			const uint16 variant = (*data)[0x1C] | (uint16((*data)[0x1D]) << 8);
+			std::array<uint8, nsyshid::SKY_FIGURE_SIZE> data{};
+			if (file->readData(data.data(), data.size()) != data.size())
+				continue;
+			const uint16 id = data[0x10] | (uint16(data[0x11]) << 8);
+			const uint16 variant = data[0x1C] | (uint16(data[0x1D]) << 8);
 			const auto* definition = Find(id, variant);
 			std::string displayName = definition ? definition->name : _pathToUtf8(it->path().stem());
 			if (displayName.empty())
